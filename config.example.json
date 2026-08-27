@@ -1,3 +1,5 @@
 {
-  "path": "E:\\path\\to\\your\\prompt.txt"
+  "path": "E:\\path\\to\\your\\prompt.txt",
+  "autostart": false,
+  "editor_path": "E:\\path\\to\\your\\tag-editor.exe"
 }

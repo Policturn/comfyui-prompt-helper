@@ -44,6 +44,23 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 `tags` 输出为文件原始内容，`status` 输出为状态消息（文件正常 / 不存在等），
 可接文本显示类节点做检查。
 
+## 自动启动词条编辑器（可选）
+
+在节点目录的 `config.json` 里配置（参照 `config.example.json`，改完重启 ComfyUI 生效）：
+
+```json
+{
+  "path": "E:\\...\\prompt.txt",
+  "autostart": true,
+  "editor_path": "E:\\...\\你的词条编辑器.exe"
+}
+```
+
+- `autostart` 为 `true` 时，ComfyUI 启动加载本节点包的同时会自动拉起 `editor_path`
+  指定的外部词条编辑器；
+- 编辑器以**独立进程**运行，关闭 ComfyUI 不会连带关闭它；
+- 检测到同名进程已在运行时不会重复拉起（和 SD WebUI 版同时开启也只启动一份）。
+
 ## 行为细节
 
 - **每次执行重新读盘**：节点通过 `IS_CHANGED` 返回 NaN 绕过 ComfyUI 的结果缓存，

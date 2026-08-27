@@ -5,9 +5,11 @@
 """
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.join(HERE, "prompt_helper_node.py")
@@ -81,5 +83,32 @@ with open(tmp_txt, "w", encoding="utf-8") as f:
 p2 = node.inject(tmp_txt, "base", "追加到末尾", True)[0]
 os.unlink(tmp_txt)
 check("文件变化后下一次执行读到新内容", p1 == "base, tag_a" and p2 == "base, tag_b")
+
+print("== 编辑器联动启动 ==")
+ok, msg = mod.launch_editor("")
+check("空路径返回错误", not ok and "未设置" in msg)
+ok, msg = mod.launch_editor(r"C:\__no_editor__.exe")
+check("无效路径返回错误", not ok and "不存在" in msg)
+check("进程检测：不存在的进程", mod._is_process_running("definitely_not_running_zzz.exe") is False)
+with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False) as f:
+    f.write("@exit 0")
+    bat_path = f.name
+ok, msg = mod.launch_editor(bat_path)
+print(f"  独立进程启动 -> [{msg}]")
+check("独立进程启动成功", ok)
+time.sleep(0.3)
+try:
+    os.unlink(bat_path)
+except OSError:
+    pass
+cfg = mod._load_config()
+check("配置含 path/autostart/editor_path", {"path", "autostart", "editor_path"} <= set(cfg))
+mod.CONFIG_PATH = os.path.join(tempfile.mkdtemp(), "config.json")
+mod.autostart_editor()
+check("autostart 关闭时无动作", True)
+with open(mod.CONFIG_PATH, "w", encoding="utf-8") as f:
+    json.dump({"autostart": True, "editor_path": r"C:\__no__.exe"}, f)
+mod.autostart_editor()
+check("autostart 开启但路径无效时不崩溃", True)
 
 print("\n全部测试通过 ✔")

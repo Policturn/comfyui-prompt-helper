@@ -7,10 +7,15 @@
 
 通过 IS_CHANGED 返回 NaN 强制每次执行都重新读盘，绕过 ComfyUI 的节点
 结果缓存——这是"文件内容实时变化"场景的关键。
+
+另提供可选联动：ComfyUI 启动加载本节点包时自动拉起外部词条编辑器
+（由 __init__.py 调用 autostart_editor；防重复启动；编辑器作为独立进程
+运行，关闭 ComfyUI 不会连带关闭它）。
 """
 
 import json
 import os
+import subprocess
 import time
 
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -18,18 +23,34 @@ CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
+DEFAULT_CONFIG = {
+    "path": "",
+    "autostart": False,
+    "editor_path": "",
+}
+
 
 def _log(message):
     print(f"[prompt-helper] {message}")
 
 
-def _default_path():
+def _load_config():
+    cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-            value = json.load(f).get("path", "")
-        return str(value)
-    except (OSError, ValueError, AttributeError):
-        return ""
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            cfg.update(loaded)
+    except (OSError, ValueError):
+        pass
+    cfg["autostart"] = bool(cfg["autostart"])
+    cfg["path"] = str(cfg["path"] or "")
+    cfg["editor_path"] = str(cfg["editor_path"] or "")
+    return cfg
+
+
+def _default_path():
+    return _load_config()["path"]
 
 
 def _normalize_path(path):
@@ -70,6 +91,57 @@ def _inject(base, tags, prepend, sep=", "):
     if not base:
         return tags
     return f"{tags}{sep}{base}" if prepend else f"{base}{sep}{tags}"
+
+
+def _is_process_running(exe_name):
+    """查询同名进程是否已在运行（用于防止编辑器被重复拉起）。"""
+    exe_name = exe_name.lower()
+    try:
+        if os.name == "nt":
+            # tasklist 在中文系统输出 GBK，errors="replace" 防止解码崩溃（exe 名匹配不受影响）
+            result = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
+                capture_output=True, text=True, errors="replace", timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return exe_name in (result.stdout or "").lower()
+        output = subprocess.run(
+            ["pgrep", "-f", exe_name], capture_output=True, text=True, timeout=10,
+        ).stdout
+        return bool((output or "").strip())
+    except (OSError, subprocess.SubprocessError):
+        return False  # 检测失败时宁可重复启动，也不要让编辑器永远起不来
+
+
+def launch_editor(editor_path):
+    """启动外部词条编辑器（独立进程，关闭 ComfyUI 不会连带关闭它）。返回 (是否成功, 消息)。"""
+    editor_path = _normalize_path(editor_path)
+    if not editor_path:
+        return False, "未设置编辑器路径"
+    if not os.path.isfile(editor_path):
+        return False, "文件不存在：" + editor_path
+
+    exe_name = os.path.basename(editor_path)
+    if _is_process_running(exe_name):
+        return True, f"{exe_name} 已在运行，跳过启动"
+
+    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+             if os.name == "nt" else 0)
+    try:
+        subprocess.Popen([editor_path], cwd=os.path.dirname(editor_path),
+                         creationflags=flags, close_fds=True)
+    except OSError as e:
+        return False, f"启动失败：{e}"
+    return True, "已启动：" + editor_path
+
+
+def autostart_editor():
+    """ComfyUI 启动加载本节点包时由 __init__.py 调用。"""
+    cfg = _load_config()
+    if not cfg["autostart"]:
+        return
+    ok, message = launch_editor(cfg["editor_path"])
+    _log(f"自动启动编辑器：{message}")
 
 
 class PromptHelperInject:
