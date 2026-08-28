@@ -26,23 +26,26 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 ## 使用
 
 1. 双击画布（或右键 → Add Node）搜索 **"外部提示词注入"** 或 **PromptHelperInject** 添加节点；
-2. `path` 填词条 txt 文件的绝对路径（资源管理器 Shift + 右键文件 → "复制文件地址"）；
-3. `base_prompt` 填你的基础提示词——也可以右键把它**转换为输入端口**，接任何文本节点；
-4. 把输出 `prompt` 接到 **CLIP Text Encode** 的 `text`；
-5. 反向提示词需要注入时，再加一个同样的节点，输出接负向条件的 CLIP Text Encode。
+2. `path` 填正向词条 txt 的绝对路径（资源管理器 Shift + 右键文件 → "复制文件地址"）；
+   需要注入反向提示词时，`negative_path` 再填一个独立的反向词条文件（**留空则不注入反向**）；
+3. `base_prompt` / `negative_base_prompt` 填正向、反向的基础提示词——
+   也可以右键把 `base_prompt` **转换为输入端口**，接任何文本节点；
+4. 输出 `prompt` 接正向 **CLIP Text Encode** 的 `text`，
+   输出 `negative_prompt` 接负向 **CLIP Text Encode** 的 `text`。
 
 ```
-┌─────────────────────────────┐          ┌──────────────────────┐
-│ 外部提示词注入 (prompt-helper) │  prompt →│ CLIP Text Encode      │→ 正向条件
-│  path: ...\prompt.txt        │          └──────────────────────┘
-│  base_prompt: masterpiece,  │
-│  position: 追加到末尾         │          ┌──────────────────────┐
-│              tags →          │──────────│ CLIP Text Encode      │→ 反向条件
-└─────────────────────────────┘ (第二个实例)└──────────────────────┘
+┌──────────────────────────────────┐   prompt →┌────────────────────┐→ 正向条件
+│ 外部提示词注入 (prompt-helper)      │           │ CLIP Text Encode   │
+│  path:          ...\prompt.txt    │          └────────────────────┘
+│  negative_path: ...\negative.txt  │ negative →┌────────────────────┐
+│  base_prompt:   masterpiece, ...  │  _prompt →│ CLIP Text Encode   │→ 反向条件
+│  negative_base_prompt: lowres, .. │           └────────────────────┘
+│  position: 追加到末尾               │   tags = 正向文件原始内容
+└──────────────────────────────────┘   status = 正反向状态汇总
 ```
 
-`tags` 输出为文件原始内容，`status` 输出为状态消息（文件正常 / 不存在等），
-可接文本显示类节点做检查。
+`tags` 输出为正向文件原始内容，`status` 输出为正反向状态汇总
+（文件正常 / 不存在 / 未设置等），可接文本显示类节点做检查。
 
 ## 自动启动词条编辑器（可选）
 
@@ -51,6 +54,7 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 ```json
 {
   "path": "E:\\...\\prompt.txt",
+  "negative_path": "E:\\...\\negative-prompt.txt",
   "autostart": true,
   "editor_path": "E:\\...\\你的词条编辑器.exe"
 }

@@ -33,10 +33,11 @@ check("显示名已配置", "PromptHelperInject" in mod.NODE_DISPLAY_NAME_MAPPIN
 
 node_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperInject"]
 inputs = node_cls.INPUT_TYPES()["required"]
-check("输入包含 path / base_prompt / position / merge_lines",
-      {"path", "base_prompt", "position", "merge_lines"} <= set(inputs))
+check("输入包含 path / negative_path / base_prompt / negative_base_prompt / position / merge_lines",
+      {"path", "negative_path", "base_prompt", "negative_base_prompt",
+       "position", "merge_lines"} <= set(inputs))
 check("path 默认值来自 config.json", inputs["path"][1].get("default", "").endswith("prompt.txt"))
-check("返回 3 个输出", node_cls.RETURN_TYPES == ("STRING", "STRING", "STRING"))
+check("返回 4 个输出", node_cls.RETURN_TYPES == ("STRING", "STRING", "STRING", "STRING"))
 
 print("== 缓存绕过 ==")
 changed = node_cls.IS_CHANGED(path=REAL_TXT)
@@ -61,26 +62,42 @@ text, msg = mod.read_tag_file(r"C:\__no_such_file__.txt")
 check("缺失文件返回错误", text is None and "不存在" in msg)
 
 print("== 注入 ==")
-prompt, tags, status = node.inject(REAL_TXT, "masterpiece, best quality", "追加到末尾", True)
 base = mod.read_tag_file(REAL_TXT)[0]
-check("追加到末尾", prompt == "masterpiece, best quality, " + base and status == "文件正常")
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("blurry, bad hands")
+    NEG_TXT = f.name
+neg_base = mod.read_tag_file(NEG_TXT)[0]
 
-prompt, tags, status = node.inject(REAL_TXT, "masterpiece", "插入到最前", True)
-check("插入到最前", prompt == base + ", masterpiece")
+prompt, negative, tags, status = node.inject(REAL_TXT, NEG_TXT, "masterpiece, best quality", "lowres", "追加到末尾", True)
+check("正向追加 + 反向文件注入", prompt == "masterpiece, best quality, " + base
+      and negative == "lowres, blurry, bad hands" and "文件正常" in status)
 
-prompt, tags, status = node.inject(REAL_TXT, "", "追加到末尾", True)
-check("基础为空时仅输出词条", prompt == base and tags == base)
+prompt, negative, tags, status = node.inject(REAL_TXT, NEG_TXT, "masterpiece", "lowres", "插入到最前", True)
+check("插入到最前（正反向各自生效）", prompt == base + ", masterpiece"
+      and negative == neg_base + ", lowres")
 
-prompt, tags, status = node.inject(r"C:\__no_such_file__.txt", "masterpiece", "追加到末尾", True)
-check("缺文件时跳过注入且不崩溃", prompt == "masterpiece" and "不存在" in status)
+prompt, negative, tags, status = node.inject(REAL_TXT, "", "", "lowres", "追加到末尾", True)
+check("反向留空不注入", prompt == base and negative == "lowres")
+
+prompt, negative, tags, status = node.inject(REAL_TXT, r"C:\__no_neg__.txt", "", "lowres", "追加到末尾", True)
+check("反向文件缺失时跳过反向", negative == "lowres" and "不存在" in status)
+
+prompt, negative, tags, status = node.inject(REAL_TXT, NEG_TXT, "", "", "追加到末尾", True)
+check("基础为空时仅输出词条", prompt == base and negative == neg_base and tags == base)
+
+prompt, negative, tags, status = node.inject(r"C:\__no_such_file__.txt", NEG_TXT, "masterpiece", "lowres", "追加到末尾", True)
+check("正向缺失时跳过且反向仍注入", prompt == "masterpiece"
+      and negative == "lowres, blurry, bad hands")
+
+os.unlink(NEG_TXT)
 
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
     f.write("tag_a")
     tmp_txt = f.name
-p1 = node.inject(tmp_txt, "base", "追加到末尾", True)[0]
+p1 = node.inject(tmp_txt, "", "base", "", "追加到末尾", True)[0]
 with open(tmp_txt, "w", encoding="utf-8") as f:
     f.write("tag_b")
-p2 = node.inject(tmp_txt, "base", "追加到末尾", True)[0]
+p2 = node.inject(tmp_txt, "", "base", "", "追加到末尾", True)[0]
 os.unlink(tmp_txt)
 check("文件变化后下一次执行读到新内容", p1 == "base, tag_a" and p2 == "base, tag_b")
 
@@ -102,7 +119,8 @@ try:
 except OSError:
     pass
 cfg = mod._load_config()
-check("配置含 path/autostart/editor_path", {"path", "autostart", "editor_path"} <= set(cfg))
+check("配置含 path/negative_path/autostart/editor_path",
+      {"path", "negative_path", "autostart", "editor_path"} <= set(cfg))
 mod.CONFIG_PATH = os.path.join(tempfile.mkdtemp(), "config.json")
 mod.autostart_editor()
 check("autostart 关闭时无动作", True)

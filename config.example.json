@@ -1,5 +1,6 @@
 {
   "path": "E:\\path\\to\\your\\prompt.txt",
+  "negative_path": "E:\\path\\to\\your\\negative-prompt.txt",
   "autostart": false,
   "editor_path": "E:\\path\\to\\your\\tag-editor.exe"
 }

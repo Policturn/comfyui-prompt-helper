@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """外部提示词注入（prompt-helper 的 ComfyUI 节点版）
 
-提供一个"外部提示词注入"节点：每次队列执行时现场重新读取词条 txt 文件
-（由 prompt-helper / FeeTagHelper 等外部词条编辑器实时输出），并把词条
-拼接到基础提示词，输出给 CLIP Text Encode 等节点。
+提供一个"外部提示词注入"节点：每次队列执行时现场重新读取正向 / 反向两个
+词条 txt 文件（由 prompt-helper / FeeTagHelper 等外部词条编辑器实时输出），
+并把词条分别拼接到正向、反向基础提示词，输出给 CLIP Text Encode 等节点
+（反向路径留空则只处理正向）。
 
 通过 IS_CHANGED 返回 NaN 强制每次执行都重新读盘，绕过 ComfyUI 的节点
 结果缓存——这是"文件内容实时变化"场景的关键。
@@ -25,6 +26,7 @@ POSITIONS = ("追加到末尾", "插入到最前")
 
 DEFAULT_CONFIG = {
     "path": "",
+    "negative_path": "",
     "autostart": False,
     "editor_path": "",
 }
@@ -44,13 +46,9 @@ def _load_config():
     except (OSError, ValueError):
         pass
     cfg["autostart"] = bool(cfg["autostart"])
-    cfg["path"] = str(cfg["path"] or "")
-    cfg["editor_path"] = str(cfg["editor_path"] or "")
+    for key in ("path", "negative_path", "editor_path"):
+        cfg[key] = str(cfg[key] or "")
     return cfg
-
-
-def _default_path():
-    return _load_config()["path"]
 
 
 def _normalize_path(path):
@@ -149,25 +147,36 @@ class PromptHelperInject:
 
     @classmethod
     def INPUT_TYPES(cls):
+        cfg = _load_config()
         return {
             "required": {
                 "path": ("STRING", {
-                    "default": _default_path(),
+                    "default": cfg["path"],
                     "multiline": False,
-                    "tooltip": "词条 txt 文件的绝对路径；每次执行时重新读取最新内容",
+                    "tooltip": "正向词条 txt 文件的绝对路径；每次执行时重新读取最新内容",
+                }),
+                "negative_path": ("STRING", {
+                    "default": cfg["negative_path"],
+                    "multiline": False,
+                    "tooltip": "反向词条 txt 文件的绝对路径；留空则不注入反向提示词",
                 }),
                 "base_prompt": ("STRING", {
                     "default": "",
                     "multiline": True,
-                    "tooltip": "现有提示词；可右键转换为输入端口，接其他文本节点",
+                    "tooltip": "正向基础提示词；可右键转换为输入端口，接其他文本节点",
+                }),
+                "negative_base_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "反向基础提示词；反向词条（若设置）会拼接到它后面/前面",
                 }),
                 "position": (list(POSITIONS), {"tooltip": "词条拼接到基础提示词的末尾还是最前"}),
                 "merge_lines": ("BOOLEAN", {"default": True, "tooltip": "把文件内换行合并为一行"}),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("prompt", "tags", "status")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative_prompt", "tags", "status")
     FUNCTION = "inject"
     CATEGORY = "prompt-helper"
     DESCRIPTION = "每次执行时重新读取外部 txt 词条文件并注入提示词（prompt-helper 桥接节点）"
@@ -177,16 +186,33 @@ class PromptHelperInject:
         # NaN 与任何值（包括自身）都不相等 → 每次队列执行都强制重新读盘
         return float("NaN")
 
-    def inject(self, path, base_prompt, position, merge_lines):
+    def inject(self, path, negative_path, base_prompt, negative_base_prompt, position, merge_lines):
+        prepend = position == POSITIONS[1]
+
+        prompt_out, tags_out, pos_status = base_prompt or "", "", ""
         tags, message = read_tag_file(path, merge_lines)
         if tags is None:
-            _log(f"跳过注入：{message}")
-            return (base_prompt or "", "", message)
+            _log(f"正向跳过注入：{message}")
+            pos_status = message
+        else:
+            prompt_out = _inject(base_prompt or "", tags, prepend)
+            tags_out = tags
+            pos_status = message
+            shown = tags[:120] + ("…" if len(tags) > 120 else "")
+            _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
 
-        combined = _inject(base_prompt or "", tags, position == POSITIONS[1])
-        shown = tags[:120] + ("…" if len(tags) > 120 else "")
-        _log(f"已注入 {len(tags)} 个字符（{message}）：{shown}")
-        return (combined, tags, message)
+        neg_out, neg_status = negative_base_prompt or "", "未设置"
+        if _normalize_path(negative_path):
+            neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
+            if neg_tags is None:
+                _log(f"反向跳过注入：{neg_message}")
+                neg_status = neg_message
+            else:
+                neg_out = _inject(negative_base_prompt or "", neg_tags, prepend)
+                neg_status = neg_message
+                _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
+
+        return (prompt_out, neg_out, tags_out, f"正向：{pos_status}；反向：{neg_status}")
 
 
 NODE_CLASS_MAPPINGS = {
