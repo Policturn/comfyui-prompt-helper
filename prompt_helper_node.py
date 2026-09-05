@@ -12,17 +12,33 @@
 另提供可选联动：ComfyUI 启动加载本节点包时自动拉起外部词条编辑器
 （由 __init__.py 调用 autostart_editor；防重复启动；编辑器作为独立进程
 运行，关闭 ComfyUI 不会连带关闭它）。
+
+FeeTagHelper 构建区可能在 txt 末尾追加元数据 tag（<fth:meta:…>，携带 BREAK
+位置 / 选一记录）。注入前会剥离该 tag（解码失败静默丢弃），解码后的元数据
+写入节点目录的 prompt_helper_meta.json（附插件版本 + 时间戳）——ComfyUI 的
+PNG 工作流元数据由节点输入值构成，运行期读取的文件内容无法注入，故用文件
+兜底记录。ComfyUI 分块机制与 WebUI 不同，breaks 位置信息不展开、直接丢弃。
 """
 
+import base64
+import binascii
 import json
 import os
+import re
 import subprocess
 import time
 
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
+META_LOG_PATH = os.path.join(NODE_DIR, "prompt_helper_meta.json")
+
+PLUGIN_VERSION = "1.4.0"
 
 POSITIONS = ("追加到末尾", "插入到最前")
+
+# FeeTagHelper 构建区元数据 tag：<fth:meta:BASE64URL>（base64url 无填充，字符集不含逗号，
+# 不破坏 tag 流；载荷为紧凑 JSON：v / breaks / pick）。追加在 txt 末尾，注入前剥离。
+META_TAG_RE = re.compile(r"<fth:meta:([A-Za-z0-9_-]+)>")
 
 DEFAULT_CONFIG = {
     "path": "",
@@ -89,6 +105,56 @@ def _inject(base, tags, prepend, sep=", "):
     if not base:
         return tags
     return f"{tags}{sep}{base}" if prepend else f"{base}{sep}{tags}"
+
+
+def _decode_meta_payload(payload):
+    """base64url 解码元数据 tag 载荷。失败返回 None（调用方静默丢弃，不报错不中断）。"""
+    try:
+        padded = payload + "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def strip_meta_tags(text):
+    """剥离词条文本中的 <fth:meta:…> 元数据 tag。返回 (剥离后文本, 元数据列表)。
+
+    元数据 tag 由 FeeTagHelper 构建区追加在 txt 末尾（base64url 编码的紧凑
+    JSON，字段 v / breaks / pick）。无论解码是否成功，整个 tag 都被移除、
+    不进入生成用提示词；解码失败的 tag 静默丢弃，不报错不中断。
+    文本不含元数据 tag 时原样返回（分隔符不动）。
+    """
+    if not text or "<fth:meta:" not in text:
+        return text, []
+
+    metas = []
+
+    def _take(match):
+        meta = _decode_meta_payload(match.group(1))
+        if meta is not None:
+            metas.append(meta)
+        return ""  # 解码失败的 tag 同样整个移除
+
+    kept = []
+    for chunk in text.split(","):
+        chunk = META_TAG_RE.sub(_take, chunk).strip()
+        if chunk:
+            kept.append(chunk)
+    return ", ".join(kept), metas
+
+
+def _record_meta(meta_by_side):
+    """把剥离出的元数据写入节点目录 sidecar JSON（附插件版本 + 时间戳，每次注入覆盖）。"""
+    entry = {"updated": time.strftime("%Y-%m-%d %H:%M:%S"), "plugin": PLUGIN_VERSION}
+    for side, meta in meta_by_side.items():
+        if meta is not None:
+            entry[side] = meta
+    try:
+        with open(META_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass  # 记录失败不影响注入
 
 
 def _is_process_running(exe_name):
@@ -189,28 +255,47 @@ class PromptHelperInject:
     def inject(self, path, negative_path, base_prompt, negative_base_prompt, position, merge_lines):
         prepend = position == POSITIONS[1]
 
-        prompt_out, tags_out, pos_status = base_prompt or "", "", ""
+        prompt_out, tags_out, pos_status, pos_meta = base_prompt or "", "", "", None
         tags, message = read_tag_file(path, merge_lines)
         if tags is None:
             _log(f"正向跳过注入：{message}")
             pos_status = message
         else:
-            prompt_out = _inject(base_prompt or "", tags, prepend)
-            tags_out = tags
-            pos_status = message
-            shown = tags[:120] + ("…" if len(tags) > 120 else "")
-            _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
+            tags, metas = strip_meta_tags(tags)
+            pos_meta = metas[-1] if metas else None
+            if not tags:
+                _log("正向跳过注入：剥离元数据 tag 后内容为空")
+                pos_status = "剥离元数据 tag 后内容为空"
+            else:
+                prompt_out = _inject(base_prompt or "", tags, prepend)
+                tags_out = tags
+                pos_status = message
+                if pos_meta is not None:
+                    _log(f"正向元数据已剥离并记录（breaks={pos_meta.get('breaks')}）")
+                shown = tags[:120] + ("…" if len(tags) > 120 else "")
+                _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
 
-        neg_out, neg_status = negative_base_prompt or "", "未设置"
+        neg_out, neg_status, neg_meta = negative_base_prompt or "", "未设置", None
         if _normalize_path(negative_path):
             neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
             if neg_tags is None:
                 _log(f"反向跳过注入：{neg_message}")
                 neg_status = neg_message
             else:
-                neg_out = _inject(negative_base_prompt or "", neg_tags, prepend)
-                neg_status = neg_message
-                _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
+                neg_tags, neg_metas = strip_meta_tags(neg_tags)
+                neg_meta = neg_metas[-1] if neg_metas else None
+                if not neg_tags:
+                    _log("反向跳过注入：剥离元数据 tag 后内容为空")
+                    neg_status = "剥离元数据 tag 后内容为空"
+                else:
+                    neg_out = _inject(negative_base_prompt or "", neg_tags, prepend)
+                    neg_status = neg_message
+                    if neg_meta is not None:
+                        _log(f"反向元数据已剥离并记录（breaks={neg_meta.get('breaks')}）")
+                    _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
+
+        if pos_meta is not None or neg_meta is not None:
+            _record_meta({"positive": pos_meta, "negative": neg_meta})
 
         return (prompt_out, neg_out, tags_out, f"正向：{pos_status}；反向：{neg_status}")
 

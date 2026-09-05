@@ -44,7 +44,7 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 └──────────────────────────────────┘   status = 正反向状态汇总
 ```
 
-`tags` 输出为正向文件原始内容，`status` 输出为正反向状态汇总
+`tags` 输出为正向文件内容（若含元数据 tag 已剥离），`status` 输出为正反向状态汇总
 （文件正常 / 不存在 / 未设置等），可接文本显示类节点做检查。
 
 ## 自动启动词条编辑器（可选）
@@ -74,6 +74,22 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
   （`prompt` 输出 = 原样 `base_prompt`），不中断队列，控制台打印 `[prompt-helper]` 日志。
 - **默认路径**：`path` 的初始默认值读取节点目录下的 `config.json`（参照
   `config.example.json`）；工作流里改过的值保存在工作流自身，优先级更高。
+
+## FeeTagHelper 元数据 tag（v1.4.0+）
+
+FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
+`<fth:meta:BASE64URL>` tag（携带 BREAK 分组位置 / 选一记录）。插件注入时会：
+
+1. **剥离**该 tag——无论解码是否成功，它都不会进入生成用提示词
+   （解码失败静默丢弃，不报错不中断）；
+2. **记录**——解码后的元数据写入节点目录的 `prompt_helper_meta.json`
+   （附插件版本号 + 时间戳，每次注入覆盖为最新快照）。ComfyUI 的 PNG
+   工作流元数据由节点输入值构成，运行期读取的文件内容无法写入，故用
+   sidecar 文件兜底；
+3. **不展开 BREAK**——ComfyUI 的提示词分块机制与 WebUI 不同，breaks
+   位置信息直接丢弃，词条以纯平铺注入。
+
+不需要剥离记录时，在 FeeTagHelper 设置里关闭"携带元数据"即可（txt 恢复纯平铺）。
 
 ## 姊妹项目
 

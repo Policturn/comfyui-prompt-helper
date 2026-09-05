@@ -4,6 +4,7 @@
 用法：python test_prompt_helper.py
 """
 
+import base64
 import importlib.util
 import json
 import os
@@ -62,7 +63,8 @@ text, msg = mod.read_tag_file(r"C:\__no_such_file__.txt")
 check("缺失文件返回错误", text is None and "不存在" in msg)
 
 print("== 注入 ==")
-base = mod.read_tag_file(REAL_TXT)[0]
+# 与插件注入管线一致地算期望值（prompt.txt 将来携带元数据 tag 时断言依然成立）
+base = mod.strip_meta_tags(mod.read_tag_file(REAL_TXT)[0])[0]
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
     f.write("blurry, bad hands")
     NEG_TXT = f.name
@@ -100,6 +102,47 @@ with open(tmp_txt, "w", encoding="utf-8") as f:
 p2 = node.inject(tmp_txt, "", "base", "", "追加到末尾", True)[0]
 os.unlink(tmp_txt)
 check("文件变化后下一次执行读到新内容", p1 == "base, tag_a" and p2 == "base, tag_b")
+
+print("== 元数据剥离（不展开 BREAK）==")
+
+
+def _b64url(s):
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _linked(tags_text, meta):
+    """模拟 FeeTagHelper 构建区的 txt 链路输出：平铺 tag 流 + 末尾元数据 tag。"""
+    return tags_text + ", <fth:meta:" + _b64url(json.dumps(meta, separators=(",", ":"))) + ">"
+
+
+META = {"v": 1, "breaks": [2], "pick": [{"path": "seg-1", "key": "smile"}]}
+
+clean, metas = mod.strip_meta_tags(_linked("1girl, smile, dress", META))
+check("元数据 tag 整体剥离", clean == "1girl, smile, dress")
+check("元数据解码为 dict", metas == [META])
+
+clean, metas = mod.strip_meta_tags("a, b, c")
+check("无元数据时原样返回", clean == "a, b, c" and metas == [])
+
+clean, metas = mod.strip_meta_tags("a, <fth:meta:zzzz>, b")
+check("解码失败静默丢弃整 tag", clean == "a, b" and metas == [])
+
+if os.path.exists(mod.META_LOG_PATH):
+    os.unlink(mod.META_LOG_PATH)
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write(_linked("1girl, smile, dress", META))
+    META_TXT = f.name
+prompt, negative, tags, status = node.inject(META_TXT, "", "base", "", "追加到末尾", True)
+check("注入前剥离元数据（BREAK 位置不展开）",
+      prompt == "base, 1girl, smile, dress" and "\n" not in prompt
+      and tags == "1girl, smile, dress" and "<fth:meta:" not in prompt + tags)
+check("元数据写入 sidecar JSON（附插件版本 + 时间戳）",
+      os.path.isfile(mod.META_LOG_PATH)
+      and json.load(open(mod.META_LOG_PATH, encoding="utf-8")).get("positive") == META
+      and json.load(open(mod.META_LOG_PATH, encoding="utf-8")).get("plugin") == mod.PLUGIN_VERSION
+      and json.load(open(mod.META_LOG_PATH, encoding="utf-8")).get("updated"))
+os.unlink(META_TXT)
+os.unlink(mod.META_LOG_PATH)
 
 print("== 编辑器联动启动 ==")
 ok, msg = mod.launch_editor("")
