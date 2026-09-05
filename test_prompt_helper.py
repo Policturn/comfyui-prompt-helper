@@ -62,7 +62,7 @@ os.unlink(gbk_path)
 text, msg = mod.read_tag_file(r"C:\__no_such_file__.txt")
 check("缺失文件返回错误", text is None and "不存在" in msg)
 
-print("== 注入 ==")
+print("== 注入（v1.4.1 起恒定前置，position 取值被忽略）==")
 # 与插件注入管线一致地算期望值（prompt.txt 将来携带元数据 tag 时断言依然成立）
 base = mod.strip_meta_tags(mod.read_tag_file(REAL_TXT)[0])[0]
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
@@ -71,11 +71,11 @@ with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf
 neg_base = mod.read_tag_file(NEG_TXT)[0]
 
 prompt, negative, tags, status = node.inject(REAL_TXT, NEG_TXT, "masterpiece, best quality", "lowres", "追加到末尾", True)
-check("正向追加 + 反向文件注入", prompt == "masterpiece, best quality, " + base
-      and negative == "lowres, blurry, bad hands" and "文件正常" in status)
+check("注入恒在最前（正反向各自生效）", prompt == base + ", masterpiece, best quality"
+      and negative == "blurry, bad hands, lowres" and "文件正常" in status)
 
 prompt, negative, tags, status = node.inject(REAL_TXT, NEG_TXT, "masterpiece", "lowres", "插入到最前", True)
-check("插入到最前（正反向各自生效）", prompt == base + ", masterpiece"
+check("position 取任意值结果一致（仅兼容旧工作流）", prompt == base + ", masterpiece"
       and negative == neg_base + ", lowres")
 
 prompt, negative, tags, status = node.inject(REAL_TXT, "", "", "lowres", "追加到末尾", True)
@@ -89,7 +89,7 @@ check("基础为空时仅输出词条", prompt == base and negative == neg_base 
 
 prompt, negative, tags, status = node.inject(r"C:\__no_such_file__.txt", NEG_TXT, "masterpiece", "lowres", "追加到末尾", True)
 check("正向缺失时跳过且反向仍注入", prompt == "masterpiece"
-      and negative == "lowres, blurry, bad hands")
+      and negative == "blurry, bad hands, lowres")
 
 os.unlink(NEG_TXT)
 
@@ -101,7 +101,7 @@ with open(tmp_txt, "w", encoding="utf-8") as f:
     f.write("tag_b")
 p2 = node.inject(tmp_txt, "", "base", "", "追加到末尾", True)[0]
 os.unlink(tmp_txt)
-check("文件变化后下一次执行读到新内容", p1 == "base, tag_a" and p2 == "base, tag_b")
+check("文件变化后下一次执行读到新内容", p1 == "tag_a, base" and p2 == "tag_b, base")
 
 print("== 元数据剥离（不展开 BREAK）==")
 
@@ -134,14 +134,30 @@ with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf
     META_TXT = f.name
 prompt, negative, tags, status = node.inject(META_TXT, "", "base", "", "追加到末尾", True)
 check("注入前剥离元数据（BREAK 位置不展开）",
-      prompt == "base, 1girl, smile, dress" and "\n" not in prompt
+      prompt == "1girl, smile, dress, base" and "\n" not in prompt
       and tags == "1girl, smile, dress" and "<fth:meta:" not in prompt + tags)
-check("元数据写入 sidecar JSON（附插件版本 + 时间戳）",
+sidecar = json.load(open(mod.META_LOG_PATH, encoding="utf-8"))
+check("元数据 + 注入统计写入 sidecar JSON（附插件版本 + 时间戳）",
       os.path.isfile(mod.META_LOG_PATH)
-      and json.load(open(mod.META_LOG_PATH, encoding="utf-8")).get("positive") == META
-      and json.load(open(mod.META_LOG_PATH, encoding="utf-8")).get("plugin") == mod.PLUGIN_VERSION
-      and json.load(open(mod.META_LOG_PATH, encoding="utf-8")).get("updated"))
+      and sidecar.get("positive", {}).get("breaks") == [2]
+      and sidecar.get("positive", {}).get("pick") == META["pick"]
+      and sidecar.get("plugin") == mod.PLUGIN_VERSION
+      and sidecar.get("updated")
+      and "negative" not in sidecar)
+check("injected_tags / full_text 字段（无元数据亦记录）",
+      sidecar.get("positive", {}).get("injected_tags") == 3
+      and sidecar.get("positive", {}).get("full_text") == "1girl, smile, dress, base")
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("tag_x, tag_y")
+    PLAIN_TXT = f.name
+node.inject(PLAIN_TXT, "", "base", "", "追加到末尾", True)
+sidecar = json.load(open(mod.META_LOG_PATH, encoding="utf-8"))
+check("txt 不带元数据时 sidecar 仍记录统计",
+      sidecar.get("positive", {}).get("injected_tags") == 2
+      and sidecar.get("positive", {}).get("full_text") == "tag_x, tag_y, base"
+      and "breaks" not in sidecar.get("positive", {}))
 os.unlink(META_TXT)
+os.unlink(PLAIN_TXT)
 os.unlink(mod.META_LOG_PATH)
 
 print("== 编辑器联动启动 ==")

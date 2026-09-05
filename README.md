@@ -40,7 +40,7 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 │  negative_path: ...\negative.txt  │ negative →┌────────────────────┐
 │  base_prompt:   masterpiece, ...  │  _prompt →│ CLIP Text Encode   │→ 反向条件
 │  negative_base_prompt: lowres, .. │           └────────────────────┘
-│  position: 追加到末尾               │   tags = 正向文件原始内容
+│  position: （恒定最前，已忽略）      │   tags = 正向文件原始内容
 └──────────────────────────────────┘   status = 正反向状态汇总
 ```
 
@@ -67,6 +67,10 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 
 ## 行为细节
 
+- **注入位置固定在最前**（v1.4.1 起位置确定化）：词条恒定拼接在基础提示词
+  最前面，输出的 `prompt` 结构恒为 `[注入词条][base_prompt]`。节点上的
+  `position` 输入**仅为兼容旧工作流保留、取值被忽略**（避免删掉输入导致
+  旧工作流组件错位）——新建工作流无需理会它。
 - **每次执行重新读盘**：节点通过 `IS_CHANGED` 返回 NaN 绕过 ComfyUI 的结果缓存，
   队列里每跑一次、每次批量迭代都会重新读取文件最新内容。
 - **编码兼容**：自动识别 UTF-8（含 BOM）与 GBK。
@@ -83,13 +87,32 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 1. **剥离**该 tag——无论解码是否成功，它都不会进入生成用提示词
    （解码失败静默丢弃，不报错不中断）；
 2. **记录**——解码后的元数据写入节点目录的 `prompt_helper_meta.json`
-   （附插件版本号 + 时间戳，每次注入覆盖为最新快照）。ComfyUI 的 PNG
+   （附插件版本号 + 时间戳，每次执行覆盖为最新快照）。ComfyUI 的 PNG
    工作流元数据由节点输入值构成，运行期读取的文件内容无法写入，故用
    sidecar 文件兜底；
 3. **不展开 BREAK**——ComfyUI 的提示词分块机制与 WebUI 不同，breaks
    位置信息直接丢弃，词条以纯平铺注入。
 
 不需要剥离记录时，在 FeeTagHelper 设置里关闭"携带元数据"即可（txt 恢复纯平铺）。
+
+sidecar 里各侧（positive / negative）记录的字段（v1.4.1 起，只要该侧注入
+成功就记录，txt 未携带元数据 tag 时也记录；该侧未注入则键缺席）：
+
+```json
+{
+  "updated": "2026-09-05 12:00:00",
+  "plugin": "1.4.1",
+  "positive": {
+    "v": 1, "breaks": [5], "pick": [...],   // 编辑器元数据（有才带）
+    "injected_tags": 22,                     // 注入区 tag 数（按逗号拆分计数，
+                                             //   与编辑器自然条 offset 同基准）
+    "full_text": "注入词条, base_prompt"      // 注入后的完整提示词
+  }
+}
+```
+
+供编辑器（如 FeeTagHelper 的 75 token 自然条）校准实际送入 CLIP 的文本；
+分块本身由编辑器端用自带 tokenizer 依据 `full_text` 自行计算。
 
 ## 姊妹项目
 

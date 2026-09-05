@@ -18,6 +18,12 @@ FeeTagHelper 构建区可能在 txt 末尾追加元数据 tag（<fth:meta:…>�
 写入节点目录的 prompt_helper_meta.json（附插件版本 + 时间戳）——ComfyUI 的
 PNG 工作流元数据由节点输入值构成，运行期读取的文件内容无法注入，故用文件
 兜底记录。ComfyUI 分块机制与 WebUI 不同，breaks 位置信息不展开、直接丢弃。
+
+v1.4.1 起注入位置确定化：词条恒定拼接在提示词最前，输出的 prompt 结构恒为
+[注入词条][base_prompt]（position 输入仅为兼容旧工作流保留，取值被忽略）。
+sidecar 各侧记录同时新增 injected_tags（注入区 tag 数，按逗号拆分计数，与
+编辑器自然条 offset 同基准）与 full_text（注入后的完整提示词）两个字段，
+供编辑器端校准实际送入 CLIP 的文本。
 """
 
 import base64
@@ -32,7 +38,7 @@ NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
 META_LOG_PATH = os.path.join(NODE_DIR, "prompt_helper_meta.json")
 
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -101,10 +107,16 @@ def read_tag_file(path, merge_lines=True):
     return None, last_error
 
 
-def _inject(base, tags, prepend, sep=", "):
+def _inject(base, tags, sep=", "):
+    # v1.4.1 起注入位置确定化：词条恒定拼接在最前，结构恒为 [注入词条][base]
     if not base:
         return tags
-    return f"{tags}{sep}{base}" if prepend else f"{base}{sep}{tags}"
+    return f"{tags}{sep}{base}"
+
+
+def _count_tags(text):
+    """按逗号拆分统计非空 tag 数（与编辑器自然条 offset 同基准，BREAK 展开前计数）。"""
+    return len([t for t in (x.strip() for x in text.split(",")) if t])
 
 
 def _decode_meta_payload(payload):
@@ -144,12 +156,17 @@ def strip_meta_tags(text):
     return ", ".join(kept), metas
 
 
-def _record_meta(meta_by_side):
-    """把剥离出的元数据写入节点目录 sidecar JSON（附插件版本 + 时间戳，每次注入覆盖）。"""
+def _record_meta(records):
+    """把各侧注入记录写入节点目录 sidecar JSON（附插件版本 + 时间戳，每次执行覆盖）。
+
+    records 形如 {"positive": 记录 或 None, "negative": 记录 或 None}；每条记录为
+    元数据（可能没有）+ injected_tags（注入区 tag 数）+ full_text（注入后完整
+    提示词）的合并 dict，None 表示该侧本次未注入、键缺席。写入失败不影响注入。
+    """
     entry = {"updated": time.strftime("%Y-%m-%d %H:%M:%S"), "plugin": PLUGIN_VERSION}
-    for side, meta in meta_by_side.items():
-        if meta is not None:
-            entry[side] = meta
+    for side, record in records.items():
+        if record is not None:
+            entry[side] = record
     try:
         with open(META_LOG_PATH, "w", encoding="utf-8") as f:
             json.dump(entry, f, ensure_ascii=False, indent=2)
@@ -236,7 +253,9 @@ class PromptHelperInject:
                     "multiline": True,
                     "tooltip": "反向基础提示词；反向词条（若设置）会拼接到它后面/前面",
                 }),
-                "position": (list(POSITIONS), {"tooltip": "词条拼接到基础提示词的末尾还是最前"}),
+                "position": (list(POSITIONS), {
+                    "tooltip": "v1.4.1 起注入恒定在最前（位置确定化）；此选项仅为兼容旧工作流保留，取值被忽略",
+                }),
                 "merge_lines": ("BOOLEAN", {"default": True, "tooltip": "把文件内换行合并为一行"}),
             },
         }
@@ -253,9 +272,9 @@ class PromptHelperInject:
         return float("NaN")
 
     def inject(self, path, negative_path, base_prompt, negative_base_prompt, position, merge_lines):
-        prepend = position == POSITIONS[1]
-
-        prompt_out, tags_out, pos_status, pos_meta = base_prompt or "", "", "", None
+        # v1.4.1 起注入位置确定化：恒定拼接在最前，position 仅为兼容旧工作流保留、取值被忽略
+        prompt_out, tags_out, pos_status = base_prompt or "", "", ""
+        pos_record = None
         tags, message = read_tag_file(path, merge_lines)
         if tags is None:
             _log(f"正向跳过注入：{message}")
@@ -267,15 +286,19 @@ class PromptHelperInject:
                 _log("正向跳过注入：剥离元数据 tag 后内容为空")
                 pos_status = "剥离元数据 tag 后内容为空"
             else:
-                prompt_out = _inject(base_prompt or "", tags, prepend)
+                prompt_out = _inject(base_prompt or "", tags)
                 tags_out = tags
                 pos_status = message
+                pos_record = dict(pos_meta) if pos_meta else {}
+                pos_record["injected_tags"] = _count_tags(tags)
+                pos_record["full_text"] = prompt_out
                 if pos_meta is not None:
                     _log(f"正向元数据已剥离并记录（breaks={pos_meta.get('breaks')}）")
                 shown = tags[:120] + ("…" if len(tags) > 120 else "")
-                _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
+                _log(f"正向已注入 {pos_record['injected_tags']} 个 tag / {len(tags)} 个字符（{message}）：{shown}")
 
-        neg_out, neg_status, neg_meta = negative_base_prompt or "", "未设置", None
+        neg_out, neg_status = negative_base_prompt or "", "未设置"
+        neg_record = None
         if _normalize_path(negative_path):
             neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
             if neg_tags is None:
@@ -288,14 +311,16 @@ class PromptHelperInject:
                     _log("反向跳过注入：剥离元数据 tag 后内容为空")
                     neg_status = "剥离元数据 tag 后内容为空"
                 else:
-                    neg_out = _inject(negative_base_prompt or "", neg_tags, prepend)
+                    neg_out = _inject(negative_base_prompt or "", neg_tags)
                     neg_status = neg_message
+                    neg_record = dict(neg_meta) if neg_meta else {}
+                    neg_record["injected_tags"] = _count_tags(neg_tags)
+                    neg_record["full_text"] = neg_out
                     if neg_meta is not None:
                         _log(f"反向元数据已剥离并记录（breaks={neg_meta.get('breaks')}）")
-                    _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
+                    _log(f"反向已注入 {neg_record['injected_tags']} 个 tag / {len(neg_tags)} 个字符（{neg_message}）")
 
-        if pos_meta is not None or neg_meta is not None:
-            _record_meta({"positive": pos_meta, "negative": neg_meta})
+        _record_meta({"positive": pos_record, "negative": neg_record})
 
         return (prompt_out, neg_out, tags_out, f"正向：{pos_status}；反向：{neg_status}")
 
