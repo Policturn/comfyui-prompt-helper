@@ -63,7 +63,11 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
 - `autostart` 为 `true` 时，ComfyUI 启动加载本节点包的同时会自动拉起 `editor_path`
   指定的外部词条编辑器；
 - 编辑器以**独立进程**运行，关闭 ComfyUI 不会连带关闭它；
-- 检测到同名进程已在运行时不会重复拉起（和 SD WebUI 版同时开启也只启动一份）。
+- 检测到同名进程已在运行时不会重复拉起（和 SD WebUI 版同时开启也只启动一份）；
+- **editor_path 失效自动探测（v1.4.2）**：编辑器发版 exe 改名（如
+  `feetaghelper-v2.7.5.exe` → `v2.8.0`）后，旧配置路径失效时启动编辑器会自动
+  在同目录扫描 `feetaghelper-v*.exe`、取版本号最新的一个并写回 config——
+  发版不再需要手动更新配置（仅同目录生效；新 exe 换了目录仍需手改）。
 
 ## 行为细节
 

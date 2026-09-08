@@ -24,6 +24,15 @@ v1.4.1 起注入位置确定化：词条恒定拼接在提示词最前，输出�
 sidecar 各侧记录同时新增 injected_tags（注入区 tag 数，按逗号拆分计数，与
 编辑器自然条 offset 同基准）与 full_text（注入后的完整提示词）两个字段，
 供编辑器端校准实际送入 CLIP 的文本。
+
+v1.4.2 根治 editor_path 随编辑器发版 exe 改名失效的问题（config 硬编码完整
+路径，编辑器每次发版必断链、自动启动静默失效）：launch_editor 起始处经
+_resolve_editor_path 解析——configured 指向的 exe 存在则原样使用；已失效则
+在同目录扫描 feeeaghelper-v*.exe，按文件名版本号元组（(2, 7, 5) 式比较，
+兼容 v 前缀与任意多段数字）取最新者，并把解析结果写回 config（下次自动
+启动直接使用新路径）；同目录无候选时返回原值，保持"文件不存在"的原有报错
+行为。进程防重探测（_is_process_running）与最终 subprocess 均使用解析后的
+路径。
 """
 
 import base64
@@ -38,7 +47,7 @@ NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
 META_LOG_PATH = os.path.join(NODE_DIR, "prompt_helper_meta.json")
 
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.4.2"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -194,9 +203,57 @@ def _is_process_running(exe_name):
         return False  # 检测失败时宁可重复启动，也不要让编辑器永远起不来
 
 
+# 编辑器 exe 自动探测：编辑器发版 exe 改名（如 feeeaghelper-v2.7.5.exe
+# → v2.8.0）会让 config 硬编码的完整路径失效，故按文件名版本号在同目录自动接管。
+# 版本号解析为元组比较（v2.7.5 → (2, 7, 5)，兼容 v 前缀与任意多段数字）。
+EDITOR_EXE_RE = re.compile(r"^feetaghelper-v(\d+(?:\.\d+)*)\.exe$", re.IGNORECASE)
+
+
+def _editor_exe_version(filename):
+    """从编辑器 exe 文件名解析版本号元组（feeeaghelper-v2.7.5.exe → (2, 7, 5)）。
+    不符合 feeeaghelper-v<数字串>.exe 命名（含无版本号、非 .exe）返回 None。"""
+    match = EDITOR_EXE_RE.match(filename)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _resolve_editor_path(configured):
+    """解析编辑器 exe 路径：configured 存在 → 原样返回；已失效（编辑器发版
+    exe 改名）→ 在 configured 所在目录扫描 feeeaghelper-v*.exe，按版本号元组
+    取最新者返回，并把解析结果写回 config（下次 UI / 自动启动直接显示新路径）；
+    同目录无任何候选 → 返回原值，保持"文件不存在"的原有报错行为。"""
+    path = _normalize_path(configured)
+    if not path or os.path.isfile(path):
+        return path
+    try:
+        names = os.listdir(os.path.dirname(path))
+    except OSError:
+        return path
+    best_version, best_name = None, ""
+    for name in names:
+        version = _editor_exe_version(name)
+        if version is not None and (best_version is None or version >= best_version):
+            best_version, best_name = version, name
+    if best_version is None:
+        return path
+    resolved = os.path.join(os.path.dirname(path), best_name)
+    try:  # 解析结果写回 config（读原文件 → 只改 editor_path → 原样写回）
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("editor_path") != resolved:
+            data["editor_path"] = resolved
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            _log(f"editor_path 已失效，自动探测到最新版本并写回：{resolved}")
+    except (OSError, ValueError):
+        pass  # 写回失败不影响本次启动
+    return resolved
+
+
 def launch_editor(editor_path):
     """启动外部词条编辑器（独立进程，关闭 ComfyUI 不会连带关闭它）。返回 (是否成功, 消息)。"""
-    editor_path = _normalize_path(editor_path)
+    editor_path = _resolve_editor_path(editor_path)
     if not editor_path:
         return False, "未设置编辑器路径"
     if not os.path.isfile(editor_path):
