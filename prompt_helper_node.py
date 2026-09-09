@@ -57,7 +57,9 @@ META_LOG_PATH = os.path.join(NODE_DIR, "prompt_helper_meta.json")
 # ComfyUI 侧暂未接线（反向路径来自工作流，无回写冲空问题），仅保持双仓共享面一致。
 NEGATIVE_PIN_PATH = os.path.join(NODE_DIR, "negative_path.pin")
 
-PLUGIN_VERSION = "1.4.3"
+# v1.4.4：仅版本镜像 +1（WebUI v1.4.11 修浏览器端后台节流，其 JS 轮询为
+# WebUI 总线独有机制，ComfyUI 无对应物、零代码改动，见 同步维护说明.md 分叉规则）。
+PLUGIN_VERSION = "1.4.4"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
