@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 config.json
 prompt_helper_meta.json
+negative_path.pin

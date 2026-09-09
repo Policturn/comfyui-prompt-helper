@@ -224,4 +224,17 @@ ok, msg = mod.launch_editor(stale)
 mod._is_process_running = real_process_check
 check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
 
+print("== negative_path.pin 共享函数镜像（WebUI 侧接线；本仓验证读取语义）==")
+mod.NEGATIVE_PIN_PATH = os.path.join(tempfile.mkdtemp(), "negative_path.pin")
+check("pin 缺失返回空串（回退 config）", mod._read_negative_pin() == "")
+with open(mod.NEGATIVE_PIN_PATH, "w", encoding="utf-8") as f:
+    f.write('  "' + REAL_TXT + '"  \n')
+check("pin 读取 + 引号/空白容错", mod._read_negative_pin() == REAL_TXT)
+open(mod.NEGATIVE_PIN_PATH, "w").close()
+check("pin 空文件返回空串（回退 config）", mod._read_negative_pin() == "")
+with open(mod.NEGATIVE_PIN_PATH, "w", encoding="gbk") as f:
+    f.write(r"E:\测试\反向词条.txt")
+check("pin GBK 编码兜底可读", mod._read_negative_pin() == r"E:\测试\反向词条.txt")
+os.remove(mod.NEGATIVE_PIN_PATH)
+
 print("\n全部测试通过 ✔")

@@ -33,6 +33,13 @@ _resolve_editor_path 解析——configured 指向的 exe 存在则原样使用�
 启动直接使用新路径）；同目录无候选时返回原值，保持"文件不存在"的原有报错
 行为。进程防重探测（_is_process_running）与最终 subprocess 均使用解析后的
 路径。
+
+v1.4.3 镜像共享函数 _read_negative_pin（读节点目录根 negative_path.pin，
+纯文本一行=反向词条 txt 完整路径；utf-8 / GBK 双编码兜底，每次读取现读、
+修改即刻生效）：WebUI 版用它根治 config 反向路径被旧页面内存值回写冲空
+（pin 存在且非空时无视 config / UI 值，UI 提交值同步写回 pin）。ComfyUI
+的反向路径来自工作流节点输入、不存在该回写问题，故 inject() 语义不变，
+本仓仅镜像共享函数保持双仓共享面一致（未来如需 pin 固定反向路径可直接接线）。
 """
 
 import base64
@@ -46,8 +53,11 @@ import time
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
 META_LOG_PATH = os.path.join(NODE_DIR, "prompt_helper_meta.json")
+# 反向词条路径固定文件（v1.4.3，共享函数镜像）：存在且非空时反向路径以 pin 为准。
+# ComfyUI 侧暂未接线（反向路径来自工作流，无回写冲空问题），仅保持双仓共享面一致。
+NEGATIVE_PIN_PATH = os.path.join(NODE_DIR, "negative_path.pin")
 
-PLUGIN_VERSION = "1.4.2"
+PLUGIN_VERSION = "1.4.3"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -85,6 +95,25 @@ def _load_config():
 def _normalize_path(path):
     path = (path or "").strip().strip('"').strip("'")
     return os.path.expandvars(os.path.expanduser(path))
+
+
+def _read_negative_pin():
+    """读 negative_path.pin（节点目录根，纯文本一行=反向词条 txt 完整路径）。
+
+    每次注入现读（一次 stat+read），放置/修改/删除即刻生效，无需重启 ComfyUI。
+    存在且非空 → 返回路径（去引号/首尾空白 + expandvars/expanduser 容错，
+    utf-8 / GBK 双编码兜底）；不存在 / 空文件 / 读取失败 → 返回 ""（调用方
+    回退 config 的 negative_path，零迁移）。背景：WebUI 版 config 的
+    negative_path 会被旧页面内存值经 _save_config 反复回写冲空，pin 文件不在
+    该写回链路上、不可被冲掉。
+    """
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            with open(NEGATIVE_PIN_PATH, "r", encoding=encoding) as f:
+                return _normalize_path(f.read())
+        except (OSError, ValueError):
+            continue
+    return ""
 
 
 def read_tag_file(path, merge_lines=True):
