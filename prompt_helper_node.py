@@ -40,6 +40,13 @@ v1.4.3 镜像共享函数 _read_negative_pin（读节点目录根 negative_path.
 （pin 存在且非空时无视 config / UI 值，UI 提交值同步写回 pin）。ComfyUI
 的反向路径来自工作流节点输入、不存在该回写问题，故 inject() 语义不变，
 本仓仅镜像共享函数保持双仓共享面一致（未来如需 pin 固定反向路径可直接接线）。
+
+v1.4.5 镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 的 settings.pin
+同款读取语义：JSON 任意 config 键子集，逐键优先级 settings.pin > 旧独立
+pin（negative_path.pin / positive_path.pin 迁移兼容并入）> config；路径键
+空值视作未固定、utf-8 / GBK 双编码兜底、每次现读即刻生效）。ComfyUI 的
+路径来自工作流节点输入、不存在回写冲空问题，inject() 语义不变，本仓仅
+镜像共享函数面保持双仓一致（未来如需 pin 固定路径可直接接线）。
 """
 
 import base64
@@ -56,10 +63,16 @@ META_LOG_PATH = os.path.join(NODE_DIR, "prompt_helper_meta.json")
 # 反向词条路径固定文件（v1.4.3，共享函数镜像）：存在且非空时反向路径以 pin 为准。
 # ComfyUI 侧暂未接线（反向路径来自工作流，无回写冲空问题），仅保持双仓共享面一致。
 NEGATIVE_PIN_PATH = os.path.join(NODE_DIR, "negative_path.pin")
+# 正向词条路径固定文件 + 统一设置固定文件（v1.4.5，共享函数镜像）：WebUI v1.4.12
+# 的 settings.pin（JSON 任意 config 键子集）同款读取语义；ComfyUI 侧暂未接线，
+# 仅保持双仓共享面一致。
+POSITIVE_PIN_PATH = os.path.join(NODE_DIR, "positive_path.pin")
+SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
 
-# v1.4.4：仅版本镜像 +1（WebUI v1.4.11 修浏览器端后台节流，其 JS 轮询为
-# WebUI 总线独有机制，ComfyUI 无对应物、零代码改动，见 同步维护说明.md 分叉规则）。
-PLUGIN_VERSION = "1.4.4"
+# v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
+# 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
+# 仅共享函数面，inject 语义不变。
+PLUGIN_VERSION = "1.4.5"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -99,23 +112,63 @@ def _normalize_path(path):
     return os.path.expandvars(os.path.expanduser(path))
 
 
-def _read_negative_pin():
-    """读 negative_path.pin（节点目录根，纯文本一行=反向词条 txt 完整路径）。
-
-    每次注入现读（一次 stat+read），放置/修改/删除即刻生效，无需重启 ComfyUI。
-    存在且非空 → 返回路径（去引号/首尾空白 + expandvars/expanduser 容错，
-    utf-8 / GBK 双编码兜底）；不存在 / 空文件 / 读取失败 → 返回 ""（调用方
-    回退 config 的 negative_path，零迁移）。背景：WebUI 版 config 的
-    negative_path 会被旧页面内存值经 _save_config 反复回写冲空，pin 文件不在
-    该写回链路上、不可被冲掉。
-    """
+def _read_pin_file(path):
+    """读单行路径 pin 文件（旧独立 pin 机制，v1.4.3 镜像）。存在且非空 → 返回
+    路径（去引号/首尾空白 + expandvars/expanduser 容错，utf-8 / GBK 双编码
+    兜底）；不存在 / 空文件 / 读取失败 → 返回 ""。"""
     for encoding in ("utf-8-sig", "gb18030"):
         try:
-            with open(NEGATIVE_PIN_PATH, "r", encoding=encoding) as f:
+            with open(path, "r", encoding=encoding) as f:
                 return _normalize_path(f.read())
         except (OSError, ValueError):
             continue
     return ""
+
+
+def _read_negative_pin():
+    """读 negative_path.pin（v1.4.3 旧机制读取接口原样保留，现为
+    _read_pin_overrides 的兼容层）。"""
+    return _read_pin_file(NEGATIVE_PIN_PATH)
+
+
+def _read_pin_json(path):
+    """读 JSON pin 文件（settings.pin，v1.4.5 镜像）。缺失 / 损坏 / 非对象 →
+    返回 {}，不抛错；utf-8 / GBK 双编码兜底（与单行 pin 同款容错）。"""
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _read_pin_overrides():
+    """读统一固定文件 settings.pin（JSON，任意 config 键子集）并合并旧独立 pin
+    （v1.4.5 镜像 WebUI v1.4.12 同款读取语义，本仓暂未接线、仅共享面一致）。
+
+    读取优先级（逐键）：settings.pin > 旧独立 pin（negative_path.pin /
+    positive_path.pin，迁移兼容）> config（调用方回退，零迁移）。每次现读，
+    放置/修改/删除即刻生效，无需重启 ComfyUI。返回仅含本仓 config 键
+    （path / negative_path / autostart / editor_path）；路径键空值视作未固定
+    （不遮蔽旧独立 pin / config），布尔键原样透传（调用方按键语义强转）。
+    """
+    overrides = {}
+    for pin_path, key in ((NEGATIVE_PIN_PATH, "negative_path"),
+                          (POSITIVE_PIN_PATH, "path")):
+        value = _read_pin_file(pin_path)
+        if value:
+            overrides[key] = value
+    for key, value in _read_pin_json(SETTINGS_PIN_PATH).items():
+        if key not in DEFAULT_CONFIG:
+            continue
+        if key in ("path", "negative_path", "editor_path"):
+            value = _normalize_path(str(value or ""))
+            if not value:
+                continue  # 空值 = 该键未固定，勿遮蔽旧独立 pin / config
+        overrides[key] = value
+    return overrides
 
 
 def read_tag_file(path, merge_lines=True):

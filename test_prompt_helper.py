@@ -224,17 +224,45 @@ ok, msg = mod.launch_editor(stale)
 mod._is_process_running = real_process_check
 check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
 
-print("== negative_path.pin 共享函数镜像（WebUI 侧接线；本仓验证读取语义）==")
+print("== settings.pin 统一固定共享函数镜像（WebUI 侧接线；本仓验证读取语义）==")
 mod.NEGATIVE_PIN_PATH = os.path.join(tempfile.mkdtemp(), "negative_path.pin")
-check("pin 缺失返回空串（回退 config）", mod._read_negative_pin() == "")
+mod.POSITIVE_PIN_PATH = os.path.join(tempfile.mkdtemp(), "positive_path.pin")
+mod.SETTINGS_PIN_PATH = os.path.join(tempfile.mkdtemp(), "settings.pin")
+check("pin 缺失：overrides 为空（回退 config）", mod._read_pin_overrides() == {})
+check("_read_negative_pin 旧接口保留（现兼容层）", mod._read_negative_pin() == "")
 with open(mod.NEGATIVE_PIN_PATH, "w", encoding="utf-8") as f:
     f.write('  "' + REAL_TXT + '"  \n')
-check("pin 读取 + 引号/空白容错", mod._read_negative_pin() == REAL_TXT)
+check("旧 negative_path.pin：引号/空白容错并入 overrides",
+      mod._read_pin_overrides() == {"negative_path": REAL_TXT})
 open(mod.NEGATIVE_PIN_PATH, "w").close()
-check("pin 空文件返回空串（回退 config）", mod._read_negative_pin() == "")
+check("旧 negative_path.pin：空文件不并入（回退 config）", mod._read_pin_overrides() == {})
 with open(mod.NEGATIVE_PIN_PATH, "w", encoding="gbk") as f:
     f.write(r"E:\测试\反向词条.txt")
-check("pin GBK 编码兜底可读", mod._read_negative_pin() == r"E:\测试\反向词条.txt")
+check("旧 negative_path.pin：GBK 编码兜底可读",
+      mod._read_negative_pin() == r"E:\测试\反向词条.txt")
+with open(mod.POSITIVE_PIN_PATH, "w", encoding="gbk") as f:
+    f.write(REAL_TXT)
+check("旧 positive_path.pin：GBK 兜底并入 overrides",
+      mod._read_pin_overrides() == {"negative_path": r"E:\测试\反向词条.txt", "path": REAL_TXT})
+with open(mod.SETTINGS_PIN_PATH, "w", encoding="utf-8") as f:
+    json.dump({"path": REAL_TXT, "negative_path": r"E:\settings\反向.txt",
+               "autostart": True, "editor_path": r"E:\settings\editor.exe",
+               "enabled": True, "unknown": 1}, f)
+check("settings.pin：本仓四键全读取 + 表外键（enabled 等）忽略",
+      mod._read_pin_overrides() == {"path": REAL_TXT, "negative_path": r"E:\settings\反向.txt",
+                                    "autostart": True, "editor_path": r"E:\settings\editor.exe"})
+with open(mod.SETTINGS_PIN_PATH, "w", encoding="gbk") as f:
+    json.dump({"editor_path": r"E:\测试\编辑器.exe"}, f)
+check("settings.pin：GBK 编码兜底可读",
+      mod._read_pin_overrides() == {"negative_path": r"E:\测试\反向词条.txt",
+                                    "path": REAL_TXT, "editor_path": r"E:\测试\编辑器.exe"})
+with open(mod.SETTINGS_PIN_PATH, "w", encoding="utf-8") as f:
+    json.dump({"negative_path": "   "}, f)
+check("settings.pin：路径键空值视作未固定（不遮蔽旧独立 pin）",
+      mod._read_pin_overrides() == {"negative_path": r"E:\测试\反向词条.txt", "path": REAL_TXT})
 os.remove(mod.NEGATIVE_PIN_PATH)
+os.remove(mod.POSITIVE_PIN_PATH)
+os.remove(mod.SETTINGS_PIN_PATH)
+check("拆除全部 pin 后 overrides 复位为空", mod._read_pin_overrides() == {})
 
 print("\n全部测试通过 ✔")
