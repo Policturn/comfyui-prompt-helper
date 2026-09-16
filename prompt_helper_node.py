@@ -77,7 +77,7 @@ SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
-PLUGIN_VERSION = "1.4.6"
+PLUGIN_VERSION = "1.4.7"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
