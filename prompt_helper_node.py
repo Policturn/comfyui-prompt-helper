@@ -47,6 +47,11 @@ pin（negative_path.pin / positive_path.pin 迁移兼容并入）> config；路�
 空值视作未固定、utf-8 / GBK 双编码兜底、每次现读即刻生效）。ComfyUI 的
 路径来自工作流节点输入、不存在回写冲空问题，inject() 语义不变，本仓仅
 镜像共享函数面保持双仓一致（未来如需 pin 固定路径可直接接线）。
+
+v1.4.6 版本镜像 +1：WebUI v1.4.13 指令延迟压缩（总线轮询 500ms→200ms +
+apply 完成信号 applied_ts 取代固定盲等 700ms + 信号等待双节拍驱动）为
+生成页总线专属机制，ComfyUI 无 JS 轮询 / 无浏览器触发链，零代码改动仅
+版本对齐（分叉规则见 同步维护说明.md）。
 """
 
 import base64
@@ -72,7 +77,7 @@ SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
-PLUGIN_VERSION = "1.4.5"
+PLUGIN_VERSION = "1.4.6"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
