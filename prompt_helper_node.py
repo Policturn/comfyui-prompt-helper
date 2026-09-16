@@ -49,9 +49,16 @@ pin（negative_path.pin / positive_path.pin 迁移兼容并入）> config；路�
 镜像共享函数面保持双仓一致（未来如需 pin 固定路径可直接接线）。
 
 v1.4.6 版本镜像 +1：WebUI v1.4.13 指令延迟压缩（总线轮询 500ms→200ms +
-apply 完成信号 applied_ts 取代固定盲等 700ms + 信号等待双节拍驱动）为
+apply 完成信号 applied_ts 取代盲等 700ms + 信号等待双节拍驱动）为
 生成页总线专属机制，ComfyUI 无 JS 轮询 / 无浏览器触发链，零代码改动仅
 版本对齐（分叉规则见 同步维护说明.md）。
+
+v1.4.8 镜像共享函数 _atomic_write_text（WebUI v1.4.16 配置 / 状态原子写
+同款：同目录临时文件 + os.replace 原子落盘，读者不再可能读到半截 JSON），
+_config_lock 镜像定义保持共享块逐字一致；本仓应用于 _resolve_editor_path
+的 config 写回与 _record_meta 的 sidecar 写入。WebUI v1.4.16 其余三项
+（接线分组分线 / Reload UI 接线复位 / 总线看门狗）为生成页总线专属机制，
+ComfyUI 无对应机制零改动（分叉规则见 同步维护说明.md）。
 """
 
 import base64
@@ -60,6 +67,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,9 +85,14 @@ SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
-PLUGIN_VERSION = "1.4.7"
+PLUGIN_VERSION = "1.4.8"
 
 POSITIONS = ("追加到末尾", "插入到最前")
+
+# config 族文件写锁（v1.4.8 镜像，与 _atomic_write_text 配套）：串行化
+# _resolve_editor_path 写回与 _record_meta sidecar 写入的并发（WebUI 侧还
+# 串行 _save_config / settings.pin，本仓保持共享块逐字一致故一并定义）
+_config_lock = threading.Lock()
 
 # FeeTagHelper 构建区元数据 tag：<fth:meta:BASE64URL>（base64url 无填充，字符集不含逗号，
 # 不破坏 tag 流；载荷为紧凑 JSON：v / breaks / pick）。追加在 txt 末尾，注入前剥离。
@@ -97,15 +110,51 @@ def _log(message):
     print(f"[prompt-helper] {message}")
 
 
+def _atomic_write_text(path, text):
+    """原子写文本文件（v1.4.16，共享函数）：先写同目录临时文件再 os.replace
+    覆盖目标（同卷原子操作，Windows / Linux 均原子）。读者（编辑器面板轮询 /
+    下次 _load_config）只会看到完整的旧版或新版内容，不会读到半截；进程在
+    写入中途崩溃也只会留下临时文件、目标保持旧版。
+
+    Windows 细节：目标正被并发读者持有句柄时 replace 可能短暂 PermissionError
+    （CPython 的读取端不带 FILE_SHARE_DELETE，而 Rust / JS 读端带、不受影响）
+    ——读取窗口只有微秒级，短暂重试后仍失败才抛 OSError（调用方兜底、目标
+    保持旧版），临时文件尽力清理。"""
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _load_config():
     cfg = dict(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            cfg.update(loaded)
-    except (OSError, ValueError):
-        pass
+    loaded = None
+    for attempt in range(3):  # v1.4.8 镜像：原子替换窗口内 open 可能被短暂拒绝，重读即愈
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                loaded = json.load(f)
+            break
+        except FileNotFoundError:
+            break  # 配置缺失（新装机常态）：默认值即可，不重试不拖延
+        except (OSError, ValueError):
+            if attempt < 2:
+                time.sleep(0.05)
+    if isinstance(loaded, dict):
+        cfg.update(loaded)
     cfg["autostart"] = bool(cfg["autostart"])
     for key in ("path", "negative_path", "editor_path"):
         cfg[key] = str(cfg[key] or "")
@@ -266,8 +315,8 @@ def _record_meta(records):
         if record is not None:
             entry[side] = record
     try:
-        with open(META_LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(entry, f, ensure_ascii=False, indent=2)
+        with _config_lock:
+            _atomic_write_text(META_LOG_PATH, json.dumps(entry, ensure_ascii=False, indent=2))
     except OSError:
         pass  # 记录失败不影响注入
 
@@ -292,15 +341,15 @@ def _is_process_running(exe_name):
         return False  # 检测失败时宁可重复启动，也不要让编辑器永远起不来
 
 
-# 编辑器 exe 自动探测：编辑器发版 exe 改名（如 feeeaghelper-v2.7.5.exe
+# 编辑器 exe 自动探测：编辑器发版 exe 改名（如 feetaghelper-v2.7.5.exe
 # → v2.8.0）会让 config 硬编码的完整路径失效，故按文件名版本号在同目录自动接管。
 # 版本号解析为元组比较（v2.7.5 → (2, 7, 5)，兼容 v 前缀与任意多段数字）。
 EDITOR_EXE_RE = re.compile(r"^feetaghelper-v(\d+(?:\.\d+)*)\.exe$", re.IGNORECASE)
 
 
 def _editor_exe_version(filename):
-    """从编辑器 exe 文件名解析版本号元组（feeeaghelper-v2.7.5.exe → (2, 7, 5)）。
-    不符合 feeeaghelper-v<数字串>.exe 命名（含无版本号、非 .exe）返回 None。"""
+    """从编辑器 exe 文件名解析版本号元组（feetaghelper-v2.7.5.exe → (2, 7, 5)）。
+    不符合 feetaghelper-v<数字串>.exe 命名（含无版本号、非 .exe）返回 None。"""
     match = EDITOR_EXE_RE.match(filename)
     if not match:
         return None
@@ -309,7 +358,7 @@ def _editor_exe_version(filename):
 
 def _resolve_editor_path(configured):
     """解析编辑器 exe 路径：configured 存在 → 原样返回；已失效（编辑器发版
-    exe 改名）→ 在 configured 所在目录扫描 feeeaghelper-v*.exe，按版本号元组
+    exe 改名）→ 在 configured 所在目录扫描 feetaghelper-v*.exe，按版本号元组
     取最新者返回，并把解析结果写回 config（下次 UI / 自动启动直接显示新路径）；
     同目录无任何候选 → 返回原值，保持"文件不存在"的原有报错行为。"""
     path = _normalize_path(configured)
@@ -327,14 +376,15 @@ def _resolve_editor_path(configured):
     if best_version is None:
         return path
     resolved = os.path.join(os.path.dirname(path), best_name)
-    try:  # 解析结果写回 config（读原文件 → 只改 editor_path → 原样写回）
-        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and data.get("editor_path") != resolved:
-            data["editor_path"] = resolved
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            _log(f"editor_path 已失效，自动探测到最新版本并写回：{resolved}")
+    try:  # 解析结果写回 config（读原文件 → 只改 editor_path → 原样写回；
+          # v1.4.16 起持 _config_lock + 原子落盘，与其他 config 写入并发亦无半截）
+        with _config_lock:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("editor_path") != resolved:
+                data["editor_path"] = resolved
+                _atomic_write_text(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2))
+                _log(f"editor_path 已失效，自动探测到最新版本并写回：{resolved}")
     except (OSError, ValueError):
         pass  # 写回失败不影响本次启动
     return resolved

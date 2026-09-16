@@ -223,6 +223,49 @@ mod._is_process_running = lambda exe_name: True
 ok, msg = mod.launch_editor(stale)
 mod._is_process_running = real_process_check
 check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
+check("editor_path 写回原子化：无 .tmp- 残留",
+      not [n for n in os.listdir(probe_dir) if ".tmp-" in n])
+
+print("== 原子写（v1.4.8 镜像 WebUI v1.4.16：config / sidecar 半截写根治）==")
+aw_dir = tempfile.mkdtemp()
+aw_path = os.path.join(aw_dir, "atomic.txt")
+mod._atomic_write_text(aw_path, "第一版")
+check("原子写：内容完整且无 .tmp- 残留",
+      open(aw_path, encoding="utf-8").read() == "第一版"
+      and not [n for n in os.listdir(aw_dir) if ".tmp-" in n])
+_orig_replace = os.replace
+
+
+def _boom_replace(src, dst):
+    raise OSError("replace failed (simulated)")
+
+
+os.replace = _boom_replace
+try:
+    try:
+        mod._atomic_write_text(aw_path, "第二版")
+        raise SystemExit("应当抛 OSError（调用方兜底语义依赖异常上抛）")
+    except OSError:
+        pass
+finally:
+    os.replace = _orig_replace
+check("replace 失败：旧内容保留 + 临时文件已清理",
+      open(aw_path, encoding="utf-8").read() == "第一版"
+      and not [n for n in os.listdir(aw_dir) if ".tmp-" in n])
+
+# _record_meta sidecar 原子化：inject 触发写入，无残留、内容完整
+if os.path.exists(mod.META_LOG_PATH):
+    os.unlink(mod.META_LOG_PATH)
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("atomic_probe_tag")
+    AW_TXT = f.name
+node.inject(AW_TXT, "", "base", "", "追加到末尾", True)
+sidecar = json.load(open(mod.META_LOG_PATH, encoding="utf-8"))
+check("_record_meta sidecar 原子写：内容完整 + 无 .tmp- 残留",
+      sidecar.get("positive", {}).get("full_text") == "atomic_probe_tag, base"
+      and not [n for n in os.listdir(mod.NODE_DIR) if ".tmp-" in n])
+os.unlink(AW_TXT)
+os.unlink(mod.META_LOG_PATH)
 
 print("== settings.pin 统一固定共享函数镜像（WebUI 侧接线；本仓验证读取语义）==")
 mod.NEGATIVE_PIN_PATH = os.path.join(tempfile.mkdtemp(), "negative_path.pin")
