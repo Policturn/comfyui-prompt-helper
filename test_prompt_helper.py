@@ -188,6 +188,115 @@ with open(mod.CONFIG_PATH, "w", encoding="utf-8") as f:
 mod.autostart_editor()
 check("autostart 开启但路径无效时不崩溃", True)
 
+print("== v1.4.9 镜像：launch_editor 脱离进程树（树杀免疫，WebUI v1.4.19 同款）==")
+# 拦截 Popen 捕获 argv/creationflags（不真拉起）；_is_process_running 恒 False
+# 强制走启动分支。真实启动已由上方 .bat 用例覆盖。
+import subprocess as _subproc
+_launch_calls = []
+
+
+class _FakePopenResult:
+    returncode = 0
+
+
+def _capture_popen(argv, **kwargs):
+    _launch_calls.append((list(argv), kwargs))
+    return _FakePopenResult()
+
+
+_real_popen = _subproc.Popen
+_real_proc_check = mod._is_process_running
+mod._is_process_running = lambda exe_name: False
+_subproc.Popen = _capture_popen
+try:
+    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+        f.write(b"MZ")
+        _exe = f.name
+    ok, msg = mod.launch_editor(_exe)
+finally:
+    _subproc.Popen = _real_popen
+    mod._is_process_running = _real_proc_check
+    os.unlink(_exe)
+check("启动成功回执", ok and msg.startswith("已启动"))
+if os.name == "nt":
+    _base_flags = (_subproc.DETACHED_PROCESS
+                   | _subproc.CREATE_NEW_PROCESS_GROUP)
+    _argv, _kw = _launch_calls[0]
+    check("Windows 启动：cmd /c start 中转（编辑器挂 cmd 名下、cmd 即退，"
+          "taskkill /T 快照父子链断开）",
+          _argv[:4] == ["cmd", "/c", "start", ""] and _argv[4] == _exe
+          and _kw.get("cwd") == os.path.dirname(_exe))
+    check("Windows 启动：脱离旗标 + breakaway 附带（Job 脱出）",
+          _kw.get("creationflags")
+          == _base_flags | getattr(_subproc, "CREATE_BREAKAWAY_FROM_JOB", 0))
+
+    # Job 拒绝 breakaway（CreateProcess 报错）→ cmd 中转裸旗标重试仍成功
+    _launch_calls.clear()
+
+    def _reject_breakaway(argv, **kwargs):
+        _launch_calls.append((list(argv), kwargs))
+        if (kwargs.get("creationflags") or 0) & getattr(
+                _subproc, "CREATE_BREAKAWAY_FROM_JOB", 0):
+            raise OSError(5, "Access is denied")
+        return _FakePopenResult()
+
+    mod._is_process_running = lambda exe_name: False
+    _subproc.Popen = _reject_breakaway
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(b"MZ")
+            _exe = f.name
+        ok, msg = mod.launch_editor(_exe)
+    finally:
+        _subproc.Popen = _real_popen
+        mod._is_process_running = _real_proc_check
+        os.unlink(_exe)
+    check("breakaway 被拒：cmd 中转裸旗标重试成功（保住父子链断开）",
+          ok and _launch_calls[-1][0][:4] == ["cmd", "/c", "start", ""]
+          and _launch_calls[-1][1].get("creationflags") == _base_flags)
+
+    # cmd 中转彻底不可用（策略禁/镜像缺失）→ 回退直启（保底与旧版一致）
+    _launch_calls.clear()
+
+    def _block_cmd(argv, **kwargs):
+        _launch_calls.append((list(argv), kwargs))
+        if argv and argv[0] == "cmd":
+            raise OSError("cmd blocked")
+        return _FakePopenResult()
+
+    mod._is_process_running = lambda exe_name: False
+    _subproc.Popen = _block_cmd
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(b"MZ")
+            _exe = f.name
+        ok, msg = mod.launch_editor(_exe)
+    finally:
+        _subproc.Popen = _real_popen
+        mod._is_process_running = _real_proc_check
+        os.unlink(_exe)
+    check("cmd 中转不可用：回退直启（argv=[exe]、脱离旗标保留）",
+          ok and _launch_calls[-1][0] == [_exe]
+          and _launch_calls[-1][1].get("creationflags") == _base_flags
+          and len(_launch_calls) == 3)  # cmd+breakaway → cmd 裸旗标 → 直启
+
+# 熔断（v1.4.9 追加）：空 / 畸形路径不触发任何 shell 调用——Popen 零调用
+_launch_calls.clear()
+mod._is_process_running = lambda exe_name: False
+_subproc.Popen = _capture_popen
+try:
+    _malformed = ["\\", "\\\\", "/", ".", "..", "   ", '""']
+    _results = [mod.launch_editor(bad) for bad in _malformed]
+finally:
+    _subproc.Popen = _real_popen
+    mod._is_process_running = _real_proc_check
+check("熔断：空 / 畸形路径（\\ \\\\ / . .. 空白 纯引号）一律 error 回执、"
+      "零 shell 调用（防系统级「找不到文件」弹窗；空白/纯引号在解析层"
+      "归空走「未设置」分支，同为 error）",
+      all(not ok and ("编辑器路径无效" in msg or "未设置" in msg)
+          for ok, msg in _results)
+      and not _launch_calls)
+
 print("== editor_path 自动探测（编辑器发版改名根治）==")
 check("版本号解析（v 前缀 / 多段数字 / 无版本号）",
       mod._editor_exe_version("feetaghelper-v2.7.5.exe") == (2, 7, 5)

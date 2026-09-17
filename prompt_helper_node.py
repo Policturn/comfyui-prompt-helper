@@ -28,7 +28,7 @@ sidecar 各侧记录同时新增 injected_tags（注入区 tag 数，按逗号�
 v1.4.2 根治 editor_path 随编辑器发版 exe 改名失效的问题（config 硬编码完整
 路径，编辑器每次发版必断链、自动启动静默失效）：launch_editor 起始处经
 _resolve_editor_path 解析——configured 指向的 exe 存在则原样使用；已失效则
-在同目录扫描 feeeaghelper-v*.exe，按文件名版本号元组（(2, 7, 5) 式比较，
+在同目录扫描 feetaghelper-v*.exe，按文件名版本号元组（(2, 7, 5) 式比较，
 兼容 v 前缀与任意多段数字）取最新者，并把解析结果写回 config（下次自动
 启动直接使用新路径）；同目录无候选时返回原值，保持"文件不存在"的原有报错
 行为。进程防重探测（_is_process_running）与最终 subprocess 均使用解析后的
@@ -59,6 +59,21 @@ _config_lock 镜像定义保持共享块逐字一致；本仓应用于 _resolve_
 的 config 写回与 _record_meta 的 sidecar 写入。WebUI v1.4.16 其余三项
 （接线分组分线 / Reload UI 接线复位 / 总线看门狗）为生成页总线专属机制，
 ComfyUI 无对应机制零改动（分叉规则见 同步维护说明.md）。
+
+v1.4.9 镜像 launch_editor 进程树脱离（WebUI v1.4.19 同款，X-174 环境坑ⓐ：
+外部 stop 按快照父子链递归强杀宿主进程树（如 webui.py stop 的
+taskkill /F /T），编辑器作为宿主直接子进程被连带杀——DETACHED_PROCESS /
+CREATE_NEW_PROCESS_GROUP 只隔离控制台信号，挡不住显式树杀）：Windows
+分支改经 cmd /c start 中转（编辑器挂到 cmd 名下、cmd 随即退出，快照
+父子链断开，树杀不再沿链命中；启动后约 0.1s 起免疫）并附
+CREATE_BREAKAWAY_FROM_JOB（宿主被启动器放进 kill-on-close 的 Job 对象时
+子进程脱出；Job 拒绝 breakaway 则 CreateProcess 报错，裸旗标重试一次，
+cmd 中转彻底不可用再回退直启，保底行为与旧版一致）。同批追加畸形路径熔断：
+cmd 中转送 shell 前，剥引号/空白后为空或仅由分隔符与点号组成（\、\\、/、
+.、.. 等）的路径一律不送 cmd / start，直接回「编辑器路径无效」error
+（shell 类调用收到空目标会触发系统级「找不到文件」弹窗）。WebUI v1.4.19 的
+直发路径同图双落盘 + pass 双计根除为生成页总线专属机制，ComfyUI 无
+直发链路零改动（分叉规则见 同步维护说明.md）。
 """
 
 import base64
@@ -85,7 +100,7 @@ SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
-PLUGIN_VERSION = "1.4.8"
+PLUGIN_VERSION = "1.4.9"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -395,6 +410,13 @@ def launch_editor(editor_path):
     editor_path = _resolve_editor_path(editor_path)
     if not editor_path:
         return False, "未设置编辑器路径"
+    # v1.4.19 熔断（用户桌面弹「找不到 '\\' 文件」后追加）：空 / 畸形路径
+    # （剥引号与空白后为空，或仅由分隔符 / 点号组成，如 \、\\、/、.、..）
+    # 一律不送 cmd / start——shell 类调用收到空目标会触发系统级「找不到
+    # 文件」弹窗。放在 isfile 判定之前：畸形路径零 shell 交互、零歧义回执。
+    stripped = editor_path.strip().strip("\"'").strip()
+    if not stripped or all(ch in "\\/. " for ch in stripped):
+        return False, "编辑器路径无效：" + editor_path
     if not os.path.isfile(editor_path):
         return False, "文件不存在：" + editor_path
 
@@ -404,6 +426,25 @@ def launch_editor(editor_path):
 
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
              if os.name == "nt" else 0)
+    # v1.4.19（X-174 环境坑ⓐ）：DETACHED_PROCESS / CREATE_NEW_PROCESS_GROUP 只
+    # 隔离控制台信号，挡不住显式树杀（外部 stop 按快照父子链递归强杀，如
+    # webui.py stop 的 taskkill /F /T——编辑器作为宿主直接子进程被连带杀）。
+    # Windows 下两道补强：① 经 cmd /c start 中转——编辑器挂到 cmd 名下、cmd
+    # 随即退出，快照父子链断开，树杀不再沿链命中（启动后约 0.1s 起免疫）；
+    # ② 附 CREATE_BREAKAWAY_FROM_JOB——宿主被启动器放进 kill-on-close 的
+    # Job 对象时子进程脱出 Job（Job 拒绝 breakaway 则 CreateProcess 报错，
+    # 裸旗标重试一次）；cmd 中转彻底不可用再回退直启，保底与旧版一致。
+    if os.name == "nt":
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        for extra in (breakaway, 0):  # 先带 breakaway；Job 拒绝则裸旗标重试
+            try:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", editor_path],
+                    cwd=os.path.dirname(editor_path),
+                    creationflags=flags | extra, close_fds=True)
+                return True, "已启动：" + editor_path
+            except OSError:
+                continue
     try:
         subprocess.Popen([editor_path], cwd=os.path.dirname(editor_path),
                          creationflags=flags, close_fds=True)
