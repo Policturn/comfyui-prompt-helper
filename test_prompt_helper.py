@@ -335,6 +335,68 @@ check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7
 check("editor_path 写回原子化：无 .tmp- 残留",
       not [n for n in os.listdir(probe_dir) if ".tmp-" in n])
 
+print("== v1.4.10 镜像：editor.hint 编辑器自荐路径（X-177 契约，四档优先级）==")
+mod.EDITOR_HINT_PATH = os.path.join(tempfile.mkdtemp(), "editor.hint")
+hint_dir = tempfile.mkdtemp()
+hint_exe = os.path.join(hint_dir, "feetaghelper-v2.8.3.exe")
+open(hint_exe, "wb").close()
+scan_best = os.path.join(probe_dir, "feetaghelper-v2.7.5.exe")  # 扫描档期望值
+
+
+def _write_hint(content):
+    with open(mod.EDITOR_HINT_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+# 档②：用户未设置（config 空）→ hint 直接命中（自动启动零配置可用）
+_write_hint(hint_exe)
+check("hint：config 未设置时 hint 直接命中（空 configured → hint 路径）",
+      mod._resolve_editor_path("") == hint_exe)
+_write_hint(hint_exe + "\r\n")  # 编辑器写文件惯例带尾换行
+check("hint：尾换行容忍", mod._resolve_editor_path("") == hint_exe)
+
+# 档①：config 用户值有效 → hint 永不覆盖（用户值恒优先）
+check("hint：config 用户值有效档恒优先（hint 在场也不覆盖）",
+      mod._resolve_editor_path(scan_best) == scan_best)
+
+# 档② vs 扫描档：configured 失效 + 同目录有更新候选 + hint 有效 → hint 胜、
+# 且不写回 config（编辑器永不改插件 config，单向传值）
+with open(mod.CONFIG_PATH, "w", encoding="utf-8") as f:
+    json.dump({"editor_path": stale}, f)
+check("hint：与同目录扫描并存时 hint 胜（候选 v2.7.5 在场仍取 hint）",
+      mod._resolve_editor_path(stale) == hint_exe)
+check("hint：不写回 config（单向传值，config 保持用户原值）",
+      json.load(open(mod.CONFIG_PATH, encoding="utf-8"))["editor_path"] == stale)
+
+# 档③：hint 无效 → 跳过该档回落既有链（扫描救援照常）
+os.remove(mod.EDITOR_HINT_PATH)
+with open(mod.CONFIG_PATH, "w", encoding="utf-8") as f:
+    json.dump({"editor_path": stale}, f)
+check("hint：文件缺失时回落扫描档（既有救援不受影响）",
+      mod._resolve_editor_path(stale) == scan_best)
+for _bad in ("", "   ", "\\", "C:\\__no_such_hint__.exe"):
+    _write_hint(_bad)
+    check(f"hint：无效内容跳过该档（{_bad!r} → 扫描档接管）",
+          mod._resolve_editor_path(stale) == scan_best)
+os.remove(mod.EDITOR_HINT_PATH)
+
+# 启动链路：config 未配置 + hint 有效 → launch_editor 实际拉起 hint 指向的 exe
+_launch_popen = []
+_real_popen_hint = _subproc.Popen
+_real_proc_hint = mod._is_process_running
+mod._is_process_running = lambda exe_name: False
+_subproc.Popen = lambda argv, **kw: _launch_popen.append(list(argv)) or _FakePopenResult()
+try:
+    _write_hint(hint_exe)
+    ok, msg = mod.launch_editor("")
+finally:
+    _subproc.Popen = _real_popen_hint
+    mod._is_process_running = _real_proc_hint
+    os.remove(mod.EDITOR_HINT_PATH)
+check("启动链路：未配置 + hint 有效 → 拉起 hint 指向的 exe（零配置可用）",
+      ok and msg == "已启动：" + hint_exe
+      and _launch_popen and _launch_popen[0][-1] == hint_exe)
+
 print("== 原子写（v1.4.8 镜像 WebUI v1.4.16：config / sidecar 半截写根治）==")
 aw_dir = tempfile.mkdtemp()
 aw_path = os.path.join(aw_dir, "atomic.txt")

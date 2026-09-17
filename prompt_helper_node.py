@@ -96,11 +96,17 @@ NEGATIVE_PIN_PATH = os.path.join(NODE_DIR, "negative_path.pin")
 # 仅保持双仓共享面一致。
 POSITIVE_PIN_PATH = os.path.join(NODE_DIR, "positive_path.pin")
 SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
+# 编辑器自荐路径（v1.4.10，X-177 契约）：插件根 editor.hint，单行文本 =
+# 编辑器 exe 绝对路径（编辑器侧在连接「检测」时幂等写入；编辑器永不改
+# 插件 config，单向传值）。解析链位次：config 用户值有效 > editor.hint
+# 有效 > 同目录扫描最新版（救援保持）> 原有兜底——用户值恒优先，hint
+# 只在用户未设置 / 已失效时兜住（零配置可用）。已被 .gitignore 排除。
+EDITOR_HINT_PATH = os.path.join(NODE_DIR, "editor.hint")
 
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
-PLUGIN_VERSION = "1.4.9"
+PLUGIN_VERSION = "1.4.10"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -371,13 +377,49 @@ def _editor_exe_version(filename):
     return tuple(int(part) for part in match.group(1).split("."))
 
 
+def _read_editor_hint():
+    """读插件根 editor.hint（v1.4.10 编辑器自荐路径契约）：单行 exe 绝对
+    路径，取首行、剥引号与空白。任何读取异常都不外抛；文件缺失 / 空 /
+    畸形（剥引号空白后为空或仅由分隔符点号组成——熔断守卫同款语义）/
+    指向不存在的文件，一律返回 ""（= 该档无效，解析链跳过继续走扫描
+    兜底）。编码兜底 utf-8-sig → gb18030。"""
+    try:
+        with open(EDITOR_HINT_PATH, "rb") as f:
+            raw = f.read(4096)
+    except OSError:
+        return ""
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("gb18030")
+        except UnicodeDecodeError:
+            return ""
+    lines = text.splitlines()
+    line = lines[0].strip().strip("\"'").strip() if lines else ""
+    if not line or all(ch in "\\/. " for ch in line) or not os.path.isfile(line):
+        return ""
+    return line
+
+
 def _resolve_editor_path(configured):
-    """解析编辑器 exe 路径：configured 存在 → 原样返回；已失效（编辑器发版
-    exe 改名）→ 在 configured 所在目录扫描 feetaghelper-v*.exe，按版本号元组
-    取最新者返回，并把解析结果写回 config（下次 UI / 自动启动直接显示新路径）；
-    同目录无任何候选 → 返回原值，保持"文件不存在"的原有报错行为。"""
+    """解析编辑器 exe 路径（v1.4.10 起五档链）：① configured 存在 → 原样
+    返回（config 用户值有效，恒优先）；② editor.hint 有效 → 直接用
+    （编辑器自荐路径，不写回 config——编辑器永不改插件 config，单向传值）；
+    ③ configured 已失效（编辑器发版 exe 改名）→ 在 configured 所在目录扫描
+    feetaghelper-v*.exe，按版本号元组取最新者返回，并把解析结果写回 config
+    （下次 UI / 自动启动直接显示新路径）；④ 同目录无任何候选 → 返回原值，
+    保持"文件不存在"的原有报错行为。pin 档在调用方 launch_editor 先于本
+    函数应用（位次最高）。"""
     path = _normalize_path(configured)
-    if not path or os.path.isfile(path):
+    if path and os.path.isfile(path):
+        return path
+    # v1.4.10 editor.hint 档：用户未设置 / 已失效时编辑器自荐路径兜住
+    # （立即启动 / 自动启动零配置可用）；不写回 config，每次解析照走全链。
+    hint = _read_editor_hint()
+    if hint:
+        return hint
+    if not path:
         return path
     try:
         names = os.listdir(os.path.dirname(path))

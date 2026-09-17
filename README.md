@@ -68,6 +68,13 @@ git clone https://github.com/Policturn/comfyui-prompt-helper comfyui-prompt-help
   `feetaghelper-v2.7.5.exe` → `v2.8.0`）后，旧配置路径失效时启动编辑器会自动
   在同目录扫描 `feetaghelper-v*.exe`、取版本号最新的一个并写回 config——
   发版不再需要手动更新配置（仅同目录生效；新 exe 换了目录仍需手改）。
+- **editor.hint 编辑器自荐路径（v1.4.10）**：FeeTagHelper 编辑器在连接
+  「检测」时会把自身 exe 绝对路径写进节点目录根的 `editor.hint` 文件
+  （单行文本；编辑器**永不修改插件 config**，单向传值）。启动时的解析链：
+  **config 用户值有效 > editor.hint 有效 > 同目录扫描最新版 > 原值兜底**
+  ——你在 config 里配置的路径永远不会被 hint 覆盖；没配置时 hint 直接
+  生效（自动启动零配置可用）。hint 档不写回 config；内容缺失 / 空 /
+  畸形 / 指向不存在的文件时自动跳过该档。
 
 ## 行为细节
 
