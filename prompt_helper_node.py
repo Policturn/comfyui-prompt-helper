@@ -74,10 +74,25 @@ cmd 中转送 shell 前，剥引号/空白后为空或仅由分隔符与点号�
 （shell 类调用收到空目标会触发系统级「找不到文件」弹窗）。WebUI v1.4.19 的
 直发路径同图双落盘 + pass 双计根除为生成页总线专属机制，ComfyUI 无
 直发链路零改动（分叉规则见 同步维护说明.md）。
+
+v1.5.0（2026-09-27 拍板，ComfyUI 插件优化计划 v3 步骤 1，本仓专属——WebUI
+版无对应机制零改动，分叉规则见 同步维护说明.md）新增节点群 + 文件契约：
+插件节点 = 智能适配器（读编辑器写的文件），编辑器 = 文件写方 + 远程触发器。
+五个新节点：LoraStack（lora_list.json 循环叠加 LoRA）/ Params（params.json
+平铺参数 → typed 输出）/ ImageOutput（OUTPUT_NODE：IMAGE→PIL 落盘 ComfyUI
+output 目录，PNG tEXt 嵌入 A1111 格式 parameters + fth_meta 元数据，追加
+image_manifest.json 取图清单）/ Checkpoint（checkpoint.json 选基模）/
+Filter（filter_output.txt 过滤结果）。Inject 节点增强：hidden PROMPT 携带
+本次执行的完整 API 格式工作流图，每次执行原子写 workflow_snapshot.json
+（编辑器「生成前检查 + 原样重提交」的数据源），原有注入功能零变化。
+容错口径：LoraStack/Params/Filter 契约文件缺失损坏 → 安全默认直通（日志
+定位）；Checkpoint → 清晰报错（基模不可静默默认）；ImageOutput 各元数据源
+缺席 → 对应 parameters 段省略，保存本体不受影响。
 """
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -103,10 +118,22 @@ SETTINGS_PIN_PATH = os.path.join(NODE_DIR, "settings.pin")
 # 只在用户未设置 / 已失效时兜住（零配置可用）。已被 .gitignore 排除。
 EDITOR_HINT_PATH = os.path.join(NODE_DIR, "editor.hint")
 
+# ---- v1.5.0（2026-09-27 拍板，ComfyUI v3 计划步骤 1）文件契约路径 ----
+# 契约文件全部落在插件目录（与 config.json 同目录）。编辑器（写方）→ 插件（读方）：
+LORA_LIST_PATH = os.path.join(NODE_DIR, "lora_list.json")      # [{name, model, clip}, ...]
+PARAMS_PATH = os.path.join(NODE_DIR, "params.json")            # {seed, steps, cfg, ...} 平铺
+CHECKPOINT_PATH = os.path.join(NODE_DIR, "checkpoint.json")    # {"name": "xxx.safetensors"}
+FILTER_OUTPUT_PATH = os.path.join(NODE_DIR, "filter_output.txt")  # 过滤页实时输出（保留词条）
+# 插件（写方）→ 编辑器（读方）：
+WORKFLOW_SNAPSHOT_PATH = os.path.join(NODE_DIR, "workflow_snapshot.json")  # API 格式工作流图
+IMAGE_MANIFEST_PATH = os.path.join(NODE_DIR, "image_manifest.json")        # 取图清单（追加式）
+IMAGE_MANIFEST_CAP = 500  # 清单条数上限（超出丢最旧，防长期累积无界膨胀；编辑器消费后旧条目无留存价值）
+
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
-PLUGIN_VERSION = "1.4.10"
+# v1.5.0（2026-09-27）：ComfyUI v3 节点群（本仓专属，见模块 docstring）。
+PLUGIN_VERSION = "1.5.0"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -342,6 +369,294 @@ def _record_meta(records):
         pass  # 记录失败不影响注入
 
 
+# ---------------------------------------------------------------------------
+# v1.5.0（2026-09-27 拍板）：编辑器 ↔ 插件文件契约的读写助手
+# ---------------------------------------------------------------------------
+
+def _read_json_file(path, expect):
+    """容错读 JSON 契约文件（编辑器写方）。返回 (数据或 None, 错误消息)。
+
+    expect 为期望顶层类型（dict / list），不符视作损坏。utf-8-sig / GBK 双编码
+    兜底 + 编辑器写入瞬间短暂占用的重读（与 read_tag_file / _read_pin_json
+    同款语义）。调用方按节点语义决定安全默认或清晰报错。"""
+    if not _normalize_path(path):
+        return None, "未设置文件路径"
+    if not os.path.isfile(path):
+        return None, "文件不存在：" + path
+    last_error = "编码无法识别（UTF-8 / GBK 均解码失败）"
+    for _ in range(3):
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                with open(path, "r", encoding=encoding) as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as e:
+                last_error = f"读取失败：{e}"
+                continue
+            if not isinstance(data, expect):
+                return None, "格式不符：顶层应为" + ("对象" if expect is dict else "数组")
+            return data, ""
+        time.sleep(0.05)
+    return None, last_error
+
+
+def _to_int(value, default):
+    """宽松 int 强转（"20" / 20 → 20；坏值 / None → default）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value, default):
+    """宽松 float 强转（"7" / 7 / 7.0 → float；坏值 / None → default）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# Params 节点安全默认（params.json 缺失 / 损坏时工作流仍可跑；采样器名用
+# ComfyUI 原生拼写，A1111 别名（Euler a 等）的映射归编辑器写方负责）
+PARAMS_DEFAULTS = {
+    "seed": 0, "steps": 20, "cfg": 7.0, "sampler": "euler",
+    "scheduler": "normal", "width": 512, "height": 512, "batch": 1,
+}
+
+
+def _read_params(params_file):
+    """读 params.json（编辑器写方，平铺参数）→ typed dict。返回 (params, 错误消息)。
+
+    缺失 / 损坏 → 全默认值 + 非空错误消息（调用方日志定位）；文件在但个别键
+    坏值 → 仅该键回落默认。字符串数值（"20"）宽松强转。"""
+    data, err = _read_json_file(params_file, dict)
+    params = dict(PARAMS_DEFAULTS)
+    if data:
+        params["seed"] = _to_int(data.get("seed"), params["seed"])
+        params["steps"] = _to_int(data.get("steps"), params["steps"])
+        params["cfg"] = _to_float(data.get("cfg"), params["cfg"])
+        params["width"] = _to_int(data.get("width"), params["width"])
+        params["height"] = _to_int(data.get("height"), params["height"])
+        params["batch"] = _to_int(data.get("batch"), params["batch"])
+        params["sampler"] = str(data.get("sampler") or "").strip() or params["sampler"]
+        params["scheduler"] = str(data.get("scheduler") or "").strip() or params["scheduler"]
+    return params, err
+
+
+def _read_lora_list(lora_file):
+    """读 lora_list.json → 规范化条目列表。返回 (entries, 错误消息)。
+
+    [{name, model, clip}, ...]：name 必填（strip 后非空），权重缺省 1.0、
+    坏值回落 1.0；非对象条目 / 无名条目静默跳过（写方脏数据不拦整链）。
+    缺失 / 损坏 → 空列表（LoraStack 直通安全默认）。"""
+    data, err = _read_json_file(lora_file, list)
+    entries = []
+    for item in (data or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        entries.append({
+            "name": name,
+            "model": _to_float(item.get("model", 1.0), 1.0),
+            "clip": _to_float(item.get("clip", 1.0), 1.0),
+        })
+    return entries, err
+
+
+def _read_checkpoint_name(checkpoint_file):
+    """读 checkpoint.json（{"name": "xxx.safetensors"}）。返回 (名字或 None, 错误消息)。"""
+    data, err = _read_json_file(checkpoint_file, dict)
+    if data is None:
+        return None, err
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return None, "未指定模型名（checkpoint.json 的 name 为空）"
+    return name, ""
+
+
+def _parse_filter_output(text):
+    """解析 filter_output.txt（编辑器过滤页实时输出）→ (kept_tags, removed, total, rules)。
+
+    双格式容忍（读方适配，写方格式由编辑器侧定，v3 步骤 4 落地）：
+    ① 纯文本 = 契约表基线格式（逗号拼接保留词条）：kept 原文、total 按逗号
+       拆分计数，removed 无从得知记 0、rules 记 None（未知）；
+    ② JSON 对象信封（可选增强）：kept / kept_tags（字符串或数组）、
+       removed / removed_count、total、rules / active_rules——统计字段齐全，
+       节点 status 可报「活跃 N 条规则」。形似 {face} 的词条 JSON 解析失败
+       自然回落纯文本路径。"""
+    text = (text or "").strip()
+    if not text:
+        return "", 0, 0, None
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            kept = data.get("kept_tags", data.get("kept", ""))
+            if isinstance(kept, list):
+                kept = ", ".join(str(t).strip() for t in kept if str(t).strip())
+            kept = str(kept or "").strip()
+            removed = _to_int(data.get("removed_count", data.get("removed")), 0)
+            total = _to_int(data.get("total"), _count_tags(kept))
+            rules = _to_int(data.get("active_rules", data.get("rules")), None)
+            return kept, removed, total, rules
+    return text, 0, _count_tags(text), None
+
+
+def _write_workflow_snapshot(workflow):
+    """把本次执行的完整工作流图（hidden PROMPT，ComfyUI API 格式）原子写入插件
+    目录 workflow_snapshot.json——编辑器读它做「生成前 mtime 检查 + 原样重提交
+    POST /prompt」。非 dict（前端未传 / 旧版本缺席）直接跳过；写失败不影响注入。"""
+    if not isinstance(workflow, dict) or not workflow:
+        return False
+    try:
+        with _config_lock:
+            _atomic_write_text(
+                WORKFLOW_SNAPSHOT_PATH,
+                json.dumps(workflow, ensure_ascii=False, indent=2))
+        return True
+    except (OSError, TypeError, ValueError):
+        _log("workflow_snapshot.json 写入失败（不影响注入）")
+        return False
+
+
+def _append_image_manifest(entries):
+    """把本队次落盘图条目追加进 image_manifest.json（编辑器取图清单，
+    [{prompt_id, filename, subfolder, ts}, ...]）。原子读改写（_config_lock
+    串行）；清单损坏则重建（旧内容放弃）；超出 IMAGE_MANIFEST_CAP 丢最旧；
+    写失败只打日志，不影响保存图像。"""
+    try:
+        with _config_lock:
+            existing = []
+            try:
+                with open(IMAGE_MANIFEST_PATH, "r", encoding="utf-8-sig") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    existing = [e for e in loaded if isinstance(e, dict)]
+            except (OSError, ValueError):
+                existing = []
+            existing.extend(entries)
+            if len(existing) > IMAGE_MANIFEST_CAP:
+                del existing[:len(existing) - IMAGE_MANIFEST_CAP]
+            _atomic_write_text(
+                IMAGE_MANIFEST_PATH,
+                json.dumps(existing, ensure_ascii=False, indent=2))
+        return True
+    except OSError:
+        _log("image_manifest.json 追加失败（不影响保存图像）")
+        return False
+
+
+_model_hash_cache = {}
+
+
+def _file_hash_prefix(path):
+    """计算文件 sha256 前 10 位十六进制（A1111 infotext 短哈希同款口径）。
+    进程内按绝对路径缓存（LoRA 文件动辄上百 MB，重复出图不重算）。失败返回 ""。"""
+    path = os.path.abspath(path)
+    cached = _model_hash_cache.get(path)
+    if cached:
+        return cached
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    value = digest.hexdigest()[:10]
+    _model_hash_cache[path] = value
+    return value
+
+
+def _resolve_lora_path(name):
+    """把 LoRA 名字解析为 models/loras 注册表下的完整路径。绝对路径且文件在 →
+    原样接受；无 ComfyUI 环境（离线干跑）/ 未注册 / 不在 → None。"""
+    if os.path.isabs(name) and os.path.isfile(name):
+        return name
+    try:
+        from folder_paths import get_full_path
+    except ImportError:
+        return None
+    try:
+        return get_full_path("loras", name) or None
+    except Exception:
+        return None
+
+
+def _lora_hashes_field(lora_entries):
+    """LoRA 短哈希 infotext 段：`"name1: hash1, name2: hash2"`（A1111
+    Lora hashes 键同款，名字去扩展名）。文件解析不到 / 哈希失败的条目跳过；
+    全空返回 ""（调用方省略该段）。"""
+    parts = []
+    for entry in lora_entries:
+        path = _resolve_lora_path(entry["name"])
+        prefix = _file_hash_prefix(path) if path else ""
+        if not prefix:
+            continue
+        parts.append(f"{os.path.splitext(entry['name'])[0]}: {prefix}")
+    return ", ".join(parts)
+
+
+def _fth_meta_records():
+    """从 sidecar prompt_helper_meta.json 取注入记录，组装 PNG 元数据 JSON 字符串。
+
+    Inject 节点每次执行先于采样 / 输出节点执行，此处读到的即本队次最新记录。
+    返回 (正向记录 JSON 或 None, 反向记录 JSON 或 None)；记录 = sidecar 各侧
+    记录**原样透传 + plugin 版本号**（编辑器元数据任意未知字段随载荷存活——
+    v1.5.0 的 filter:{from,len} 字段即走此路透传，插件不做白名单），与 WebUI
+    版 fth_meta 同构。sidecar 缺失 / 该侧未注入 → None（不嵌该 chunk）。"""
+    try:
+        with open(META_LOG_PATH, "r", encoding="utf-8-sig") as f:
+            entry = json.load(f)
+    except (OSError, ValueError):
+        return None, None
+
+    def _pack(side):
+        record = entry.get(side) if isinstance(entry, dict) else None
+        if not isinstance(record, dict) or not record:
+            return None
+        packed = dict(record)
+        packed["plugin"] = PLUGIN_VERSION
+        try:
+            return json.dumps(packed, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None
+
+    return _pack("positive"), _pack("negative")
+
+
+def _build_a1111_parameters(prompt, negative, params, model_name, lora_entries):
+    """组装 A1111 格式 parameters 全文（与 WebUI 版生成的 PNG 同构）。
+
+    结构：正向词条行 / Negative prompt 行 / 末行逗号键值对（Steps, Sampler,
+    CFG scale, Seed, Size, Model, Lora hashes）+ fth_meta 记录行（由调用方
+    追加——编辑器读侧对 parameters 原文做括号配平扫描提取记录，独立行是它
+    的现役消费路径；tEXt chunk 另存一份双保险）。params 为 {}（params.json
+    缺失 / 损坏）时省略 Steps..Size 段（不编造数值）；model_name 为 None
+    省略 Model 段；无可用 LoRA 哈希省略 Lora hashes 段。"""
+    lines = [prompt or ""]
+    if negative:
+        lines.append("Negative prompt: " + negative)
+    fields = []
+    if params:
+        fields.append(f"Steps: {params['steps']}")
+        fields.append(f"Sampler: {params['sampler']}")
+        fields.append(f"CFG scale: {params['cfg']:g}")
+        fields.append(f"Seed: {params['seed']}")
+        fields.append(f"Size: {params['width']}x{params['height']}")
+    if model_name:
+        fields.append(f"Model: {model_name}")
+    hashes = _lora_hashes_field(lora_entries)
+    if hashes:
+        fields.append('Lora hashes: "' + hashes + '"')  # A1111 形态：整体双引号包裹
+    if fields:
+        lines.append(", ".join(fields))
+    return "\n".join(lines)
+
+
 def _is_process_running(exe_name):
     """查询同名进程是否已在运行（用于防止编辑器被重复拉起）。"""
     exe_name = exe_name.lower()
@@ -537,6 +852,9 @@ class PromptHelperInject:
                 }),
                 "merge_lines": ("BOOLEAN", {"default": True, "tooltip": "把文件内换行合并为一行"}),
             },
+            # v1.5.0：hidden PROMPT = 本次执行的完整 API 格式工作流图 →
+            # workflow_snapshot.json（编辑器生成前检查 + 原样重提交的数据源）
+            "hidden": {"prompt": "PROMPT"},
         }
 
     RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
@@ -550,8 +868,11 @@ class PromptHelperInject:
         # NaN 与任何值（包括自身）都不相等 → 每次队列执行都强制重新读盘
         return float("NaN")
 
-    def inject(self, path, negative_path, base_prompt, negative_base_prompt, position, merge_lines):
+    def inject(self, path, negative_path, base_prompt, negative_base_prompt, position, merge_lines, **hidden):
         # v1.4.1 起注入位置确定化：恒定拼接在最前，position 仅为兼容旧工作流保留、取值被忽略
+        # v1.5.0 工作流上报：hidden PROMPT 落盘快照，失败 / 缺席不影响注入（零回归）
+        if _write_workflow_snapshot(hidden.get("prompt")):
+            _log(f"工作流快照已写入：{WORKFLOW_SNAPSHOT_PATH}")
         prompt_out, tags_out, pos_status = base_prompt or "", "", ""
         pos_record = None
         tags, message = read_tag_file(path, merge_lines)
@@ -604,9 +925,303 @@ class PromptHelperInject:
         return (prompt_out, neg_out, tags_out, f"正向：{pos_status}；反向：{neg_status}")
 
 
+class PromptHelperLoraStack:
+    """按编辑器 lora_list.json 依次叠加 LoRA（智能适配器：LoRA 编排全在编辑器
+    工作台做，节点每次执行现读文件、改清单即生效，工作流零改动）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "lora_file": ("STRING", {
+                    "default": LORA_LIST_PATH,
+                    "multiline": False,
+                    "tooltip": "LoRA 清单 JSON（编辑器工作台写方）：[{\"name\":\"x.safetensors\",\"model\":0.8,\"clip\":0.8},...]；缺失/损坏时直通不叠加",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "INT")
+    RETURN_NAMES = ("model", "clip", "count")
+    FUNCTION = "apply_loras"
+    CATEGORY = "prompt-helper"
+    DESCRIPTION = "读外部 LoRA 清单 JSON 依次叠加（prompt-helper 桥接节点）"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")  # 文件内容实时变化，绕过缓存每次重读
+
+    def apply_loras(self, model, clip, lora_file):
+        entries, err = _read_lora_list(lora_file)
+        if err:
+            # 安全默认：清单缺失 / 损坏 → 直通 model/clip、count=0（队列不中断）
+            _log(f"LoRA 清单读取：{err}（直通 model/clip，count=0）")
+        applied = 0
+        if entries:
+            import comfy.sd
+            import comfy.utils
+            for entry in entries:
+                path = _resolve_lora_path(entry["name"])
+                if not path:
+                    _log(f"LoRA 未找到，跳过：{entry['name']}")
+                    continue
+                try:
+                    lora = comfy.utils.load_torch_file(path, safe_load=True)
+                    model, clip = comfy.sd.load_lora_for_models(
+                        model, clip, lora, entry["model"], entry["clip"])
+                except Exception as e:  # 单个 LoRA 坏文件不拦整链
+                    _log(f"LoRA 加载失败，跳过 {entry['name']}：{e}")
+                    continue
+                applied += 1
+                _log(f"LoRA 已叠加：{entry['name']}（model={entry['model']:g}, clip={entry['clip']:g}）")
+        return (model, clip, applied)
+
+
+class PromptHelperParams:
+    """读编辑器 params.json（平铺参数）→ typed 输出（接 KSampler /
+    EmptyLatentImage 连线；生成面板改参数 = 改文件，工作流零改动）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "params_file": ("STRING", {
+                    "default": PARAMS_PATH,
+                    "multiline": False,
+                    "tooltip": "平铺参数 JSON（编辑器生成面板写方）：{seed, steps, cfg, sampler, scheduler, width, height, batch}；缺失/损坏时用默认值",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "INT", "FLOAT", "STRING", "STRING", "INT", "INT", "INT")
+    RETURN_NAMES = ("seed", "steps", "cfg", "sampler", "scheduler", "width", "height", "batch")
+    FUNCTION = "load"
+    CATEGORY = "prompt-helper"
+    DESCRIPTION = "读外部平铺参数 JSON 输出 typed 生成参数（prompt-helper 桥接节点）"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
+    def load(self, params_file):
+        params, err = _read_params(params_file)
+        if err:
+            # 安全默认：缺失 / 损坏 → 全默认值（工作流仍可跑）
+            _log(f"参数文件读取：{err}（用默认值 {json.dumps(PARAMS_DEFAULTS, ensure_ascii=False)}）")
+        else:
+            _log(f"参数已加载：seed={params['seed']} steps={params['steps']} cfg={params['cfg']:g} "
+                 f"sampler={params['sampler']} scheduler={params['scheduler']} "
+                 f"size={params['width']}x{params['height']} batch={params['batch']}")
+        return (params["seed"], params["steps"], params["cfg"], params["sampler"],
+                params["scheduler"], params["width"], params["height"], params["batch"])
+
+
+class PromptHelperImageOutput:
+    """专用取图 + 元数据嵌入节点（OUTPUT_NODE，执行终点）。
+
+    IMAGE → PIL 落盘 ComfyUI output 目录（前缀 [feetag]_）；PNG tEXt 嵌入
+    "parameters"（A1111 格式全文，与 WebUI 版生成的 PNG 同构）与 "fth_meta" /
+    "fth_meta_negative"（注入记录 JSON，编辑器图库详情 / 读图还原 / 过滤组识别
+    直接解析）；parameters 原文尾部同时按 WebUI 形态附 fth_meta 记录行（编辑器
+    读侧的现役提取路径）。元数据素材自动取自 params.json / lora_list.json /
+    checkpoint.json / sidecar（均插件目录，各源缺席省略对应段、不影响保存）。
+    落盘后追加 image_manifest.json 取图清单（编辑器 GET /view 取图依据）。"""
+
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "filename_prefix": ("STRING", {
+                    "default": "feetag",
+                    "multiline": False,
+                    "tooltip": "输出文件名前缀（支持 a/b 子目录语法，同 SaveImage）",
+                }),
+                "prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "正向提示词全文；接 Inject 节点的 prompt 输出（已含注入词条）",
+                }),
+                "negative_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "反向提示词全文；接 Inject 节点的 negative_prompt 输出",
+                }),
+            },
+            "hidden": {"prompt_id": "PROMPT_ID"},  # 写进取图清单，编辑器按队次对账
+        }
+
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
+    FUNCTION = "save_images"
+    CATEGORY = "prompt-helper"
+    DESCRIPTION = "保存图像并嵌入 A1111 parameters + fth_meta 元数据（prompt-helper 桥接节点）"
+
+    def save_images(self, image, filename_prefix, prompt, negative_prompt, **hidden):
+        from PIL import Image, PngImagePlugin
+        # 输出目录 / 命名沿用 ComfyUI SaveImage 同款（含子目录前缀与全局计数器）
+        try:
+            from folder_paths import get_output_directory, get_save_image_path
+        except ImportError:  # 无 ComfyUI 环境（离线干跑兜底，正式环境不会走到）
+            output_dir = os.path.join(NODE_DIR, "output")
+            os.makedirs(output_dir, exist_ok=True)
+
+            def get_output_directory():
+                return output_dir
+
+            def get_save_image_path(prefix, out_dir, width=0, height=0):
+                return out_dir, os.path.splitext(prefix.replace("/", "_"))[0], 0, "", prefix
+
+        # 元数据素材（各源缺席省略对应段，日志定位，不影响保存本体）
+        params, params_err = _read_params(PARAMS_PATH)
+        if params_err:
+            _log(f"params.json 读取：{params_err}（parameters 省略 Steps 等参数段）")
+        lora_entries, lora_err = _read_lora_list(LORA_LIST_PATH)
+        if lora_err:
+            _log(f"lora_list.json 读取：{lora_err}（parameters 省略 Lora hashes 段）")
+        model_name, ckpt_err = _read_checkpoint_name(CHECKPOINT_PATH)
+        if ckpt_err:
+            _log(f"checkpoint.json 读取：{ckpt_err}（parameters 省略 Model 段）")
+        meta_pos, meta_neg = _fth_meta_records()
+        params_text = _build_a1111_parameters(
+            prompt, negative_prompt, {} if params_err else params, model_name, lora_entries)
+        if meta_pos:
+            params_text += "\nfth_meta: " + meta_pos
+        if meta_neg:
+            params_text += "\nfth_meta_negative: " + meta_neg
+
+        prompt_id = str(hidden.get("prompt_id") or "")
+        output_dir = get_output_directory()
+        full_folder, filename, counter, subfolder, _prefix = get_save_image_path(
+            filename_prefix, output_dir, image.shape[1] if len(image.shape) > 2 else 0,
+            image.shape[2] if len(image.shape) > 2 else 0)
+        results, manifest_entries = [], []
+        for i in range(image.shape[0]):
+            array = (255.0 * image[i].cpu().numpy()).clip(0, 255).astype("uint8")
+            img = Image.fromarray(array)
+            file = f"{filename}_{counter:05}_{i:05}_.png"
+            metadata = PngImagePlugin.PngInfo()
+            metadata.add_text("parameters", params_text)
+            if meta_pos:
+                metadata.add_text("fth_meta", meta_pos)
+            if meta_neg:
+                metadata.add_text("fth_meta_negative", meta_neg)
+            img.save(os.path.join(full_folder, file), pnginfo=metadata, compress_level=4)
+            results.append({"filename": file, "subfolder": subfolder, "type": "output"})
+            manifest_entries.append({"prompt_id": prompt_id, "filename": file,
+                                     "subfolder": subfolder, "ts": time.time()})
+            _log(f"图像已保存（A1111 parameters + fth_meta 已嵌入）："
+                 f"{os.path.join(subfolder, file) if subfolder else file}")
+        if manifest_entries:
+            _append_image_manifest(manifest_entries)
+        return {"ui": {"images": results}, "result": ()}
+
+
+class PromptHelperCheckpoint:
+    """读编辑器 checkpoint.json（{"name": "xxx.safetensors"}）加载基模——
+    编辑器以后支持切换基础模型 = 改文件，工作流零改动。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "checkpoint_file": ("STRING", {
+                    "default": CHECKPOINT_PATH,
+                    "multiline": False,
+                    "tooltip": "基模选择 JSON（编辑器模型页写方）：{\"name\":\"xxx.safetensors\"}；缺失/未注册时报错",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING")
+    RETURN_NAMES = ("model", "clip", "vae", "name")
+    FUNCTION = "load"
+    CATEGORY = "prompt-helper"
+    DESCRIPTION = "读外部基模选择 JSON 加载 checkpoint（prompt-helper 桥接节点）"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
+    def load(self, checkpoint_file):
+        name, err = _read_checkpoint_name(checkpoint_file)
+        if name is None:
+            # 不可安全默认：基模缺席静默换模型出图比报错更糟——节点红字清晰报错
+            raise RuntimeError(
+                f"prompt-helper 基模加载失败：{err}（请在 FeeTagHelper 模型页选择基模生成 checkpoint.json）")
+        try:
+            from folder_paths import get_full_path, get_folder_paths
+        except ImportError as e:
+            raise RuntimeError(f"prompt-helper：无 ComfyUI 模型环境（{e}）")
+        path = get_full_path("checkpoints", name)
+        if not path:
+            raise RuntimeError(f"prompt-helper：模型未找到：{name}（models/checkpoints 无此文件）")
+        import comfy.sd
+        embed_dirs = get_folder_paths("embeddings")
+        out = comfy.sd.load_checkpoint_guess_config(
+            path, output_vae=True, output_clip=True,
+            embedding_directory=embed_dirs[0] if embed_dirs else None)
+        _log(f"基模已加载：{name}")
+        # name 输出 = 去 extension 的模型名（与 parameters 的 Model 字段同口径）
+        return (out[0], out[1], out[2], os.path.splitext(os.path.basename(name))[0])
+
+
+class PromptHelperFilter:
+    """读编辑器过滤页实时输出 filter_output.txt → 保留词条 + 统计。
+    过滤设置全在编辑器过滤页做，节点只消费结果（参数面板只读展示）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "filter_file": ("STRING", {
+                    "default": FILTER_OUTPUT_PATH,
+                    "multiline": False,
+                    "tooltip": "过滤输出 txt（编辑器过滤页写方）：逗号拼接保留词条，或含统计的 JSON 信封；缺失时 status=未配置",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = ("kept_tags", "removed_count", "total", "status")
+    FUNCTION = "read"
+    CATEGORY = "prompt-helper"
+    DESCRIPTION = "读外部过滤结果输出保留词条（prompt-helper 桥接节点）"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
+    def read(self, filter_file):
+        path = _normalize_path(filter_file)
+        text, message = read_tag_file(path) if path else (None, "未设置文件路径")
+        if text is None:
+            # 安全默认：未配置 = 空词条 + status 明示（不报错不拦队列）
+            _log(f"过滤结果读取：{message}（status=未配置）")
+            return ("", 0, 0, "未配置")
+        kept, removed, total, rules = _parse_filter_output(text)
+        status = f"活跃 {rules} 条规则" if rules is not None else f"保留 {total} 条词条"
+        _log(f"过滤结果：{status}（removed={removed}）")
+        return (kept, removed, total, status)
+
+
 NODE_CLASS_MAPPINGS = {
     "PromptHelperInject": PromptHelperInject,
+    "PromptHelperLoraStack": PromptHelperLoraStack,
+    "PromptHelperParams": PromptHelperParams,
+    "PromptHelperImageOutput": PromptHelperImageOutput,
+    "PromptHelperCheckpoint": PromptHelperCheckpoint,
+    "PromptHelperFilter": PromptHelperFilter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptHelperInject": "外部提示词注入 (prompt-helper)",
+    "PromptHelperLoraStack": "LoRA 清单叠加 (prompt-helper)",
+    "PromptHelperParams": "生成参数 (prompt-helper)",
+    "PromptHelperImageOutput": "保存图像·元数据嵌入 (prompt-helper)",
+    "PromptHelperCheckpoint": "基模加载 (prompt-helper)",
+    "PromptHelperFilter": "过滤结果 (prompt-helper)",
 }

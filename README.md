@@ -125,6 +125,51 @@ sidecar 里各侧（positive / negative）记录的字段（v1.4.1 起，只要�
 供编辑器（如 FeeTagHelper 的 75 token 自然条）校准实际送入 CLIP 的文本；
 分块本身由编辑器端用自带 tokenizer 依据 `full_text` 自行计算。
 
+## 节点群 v1.5.0（2026-09-27，ComfyUI v3 计划步骤 1）
+
+v1.5.0 起插件从单节点扩展为**节点群**：配合 FeeTagHelper 编辑器（文件写方 +
+远程触发器）实现"设置全在编辑器、ComfyUI 只跑图"。插件节点 = 智能适配器，
+每次执行现读插件目录下的契约文件（与 `config.json` 同目录）：
+
+| 节点 | 读 / 写 | 契约文件 | 格式 |
+|---|---|---|---|
+| 外部提示词注入（现有） | 写 | `workflow_snapshot.json` | ComfyUI API 格式工作流图（每次执行更新，编辑器生成前检查 + 原样重提交） |
+| LoRA 清单叠加 | 读 | `lora_list.json` | `[{"name":"x.safetensors","model":0.8,"clip":0.8},...]` → 循环 `load_lora_for_models`，输出 model/clip/count |
+| 生成参数 | 读 | `params.json` | `{seed, steps, cfg, sampler, scheduler, width, height, batch}` 平铺 → typed 输出接 KSampler / EmptyLatentImage |
+| 保存图像·元数据嵌入 | 读+写 | `params.json` / `lora_list.json` / `checkpoint.json` + sidecar；写 `image_manifest.json` | 见下 |
+| 基模加载 | 读 | `checkpoint.json` | `{"name":"xxx.safetensors"}` → 加载输出 model/clip/vae/name |
+| 过滤结果 | 读 | `filter_output.txt` | 逗号拼接保留词条（或含 `kept/removed/total/rules` 统计的 JSON 信封）→ kept_tags / removed_count / total / status |
+
+### 保存图像·元数据嵌入（PromptHelperImageOutput）
+
+把任何生图节点的 IMAGE 输出接到此节点（OUTPUT_NODE，执行终点）：
+
+1. IMAGE 张量 → PIL，落盘 ComfyUI output 目录（前缀默认 `feetag`，
+   文件名 `feetag_00001_00000_.png` 形态，同 SaveImage 命名规则）；
+2. 自动读 params.json / lora_list.json / checkpoint.json + 注入 sidecar，
+   组装 **A1111 格式 parameters 全文**（正向 / Negative prompt / Steps /
+   Sampler / CFG scale / Seed / Size / Model / Lora hashes——与 WebUI 版
+   生成的 PNG 完全同构，编辑器图库详情 / 读图还原零改动直接解析）；
+3. PNG tEXt 双写：`parameters`（A1111 全文，尾部附 `fth_meta: {json}` 记录
+   行，WebUI extra_generation_params 同形态）+ `fth_meta` / `fth_meta_negative`
+   独立 chunk（注入记录 JSON：breaks / pick / injected_tags / full_text /
+   filter 等字段**原样透传**，不做白名单）；
+4. 追加 `image_manifest.json` 取图清单：`[{prompt_id, filename, subfolder,
+   ts}, ...]`（`ts` = epoch 秒；上限 500 条，超出丢最旧）——编辑器据此
+   GET /view 取图。
+
+### 容错口径（v1.5.0）
+
+- **LoRA 清单 / 生成参数 / 过滤结果**：契约文件缺失 / 损坏 → 安全默认
+  （直通 model/clip、count=0 / 默认参数 / status=未配置），控制台
+  `[prompt-helper]` 日志定位，队列不中断；
+- **基模加载**：缺失 / 未注册 → 节点红字报错（基模不可静默默认）；
+- **保存图像**：各元数据源缺席省略对应 parameters 段（不编造数值），
+  保存本体与取图清单不受影响；
+- **注入节点**：工作流快照写失败不影响注入（原有功能零回归）；
+- 采样器 / 调度器名**原样透传**（ComfyUI 原生拼写如 `euler` / `normal`，
+  A1111 别名如 `Euler a` 的映射由编辑器写方负责）。
+
 ## 姊妹项目
 
 同一核心逻辑的 SD WebUI 扩展版：
