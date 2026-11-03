@@ -14,3 +14,6 @@ lora_list.json
 params.json
 checkpoint.json
 filter_output.txt
+# v1.6.0 改图链契约（运行时数据，2026-11-03）
+image.json
+images/

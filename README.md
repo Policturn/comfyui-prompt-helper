@@ -139,6 +139,7 @@ v1.5.0 起插件从单节点扩展为**节点群**：配合 FeeTagHelper 编辑�
 | 保存图像·元数据嵌入 | 读+写 | `params.json` / `lora_list.json` / `checkpoint.json` + sidecar；写 `image_manifest.json` | 见下 |
 | 基模加载 | 读 | `checkpoint.json` | `{"name":"xxx.safetensors"}` → 加载输出 model/clip/vae/name |
 | 过滤结果 | 读 | `filter_output.txt` | 逗号拼接保留词条（或含 `kept/removed/total/rules` 统计的 JSON 信封）→ kept_tags / removed_count / total / status |
+| 改图输入·图生图（v1.6.0） | 读 | `image.json` + `images/` | `{"image":"x.png","denoise":0.5}` → LoadImage 语义加载 + VAEEncode，输出 LATENT + denoise 接 KSampler |
 
 ### 保存图像·元数据嵌入（PromptHelperImageOutput）
 
@@ -169,6 +170,70 @@ v1.5.0 起插件从单节点扩展为**节点群**：配合 FeeTagHelper 编辑�
 - **注入节点**：工作流快照写失败不影响注入（原有功能零回归）；
 - 采样器 / 调度器名**原样透传**（ComfyUI 原生拼写如 `euler` / `normal`，
   A1111 别名如 `Euler a` 的映射由编辑器写方负责）。
+
+## 改图链 v1.6.0（图生图 img2img，2026-11-03）
+
+v1.6.0 新增图生图输入段：**改图输入·图生图（PromptHelperImageInput）**节点 +
+`image.json` 独立契约 + 官方工作流模板。设计纪律：**不动 `params.json` 八字段
+面、不动 Params 节点 8 输出口**（typed 输出面加键 = 旧工作流连线要重接），
+改图专属参数全部走独立契约文件。
+
+### image.json 契约（编辑器改图面板 = 写方）
+
+```json
+{
+  "image": "输入图文件名.png",
+  "denoise": 0.5
+}
+```
+
+- 契约文件落在插件目录（与 `config.json` 同目录）；**输入图实体放插件目录
+  `images/` 子目录**——编辑器（fth 侧）负责把用户选的图拷贝进来，节点侧
+  只按 `image` 里的文件名加载（basename 收敛，不取 `images/` 外路径）；
+- `denoise` 契约范围 **0.05 ~ 0.95**（编辑器滑杆范围）：缺失 / 坏值 → 默认
+  `0.5`；越界收敛到最近端（如 `1.2` → `0.95`），不报错不拦队列；
+- **容错口径（与基模加载同款纪律）**：`image.json` 缺失 / 损坏 / 缺 `image`
+  字段 / `images/` 里没有该文件 → 节点红字清晰报错，文案指路「fth 侧未写
+  image.json 或图未拷贝」——改图没有源图时静默直通（跑成意外噪声图）比
+  报错更糟；
+- 表外未知字段容忍忽略。
+
+### 改图输入·图生图（PromptHelperImageInput）节点行为
+
+读 `image.json` → **LoadImage 语义**加载 `images/<image>`（EXIF 方向转正 +
+RGB + 0..1 张量，与原生 LoadImage 节点输出同构）→ **VAEEncode**（`vae`
+输入口接基模加载节点的 `vae` 输出——LoRA 不影响 VAE，无需经过 LoRA 清单
+叠加节点）→ 输出两口：
+
+| 输出 | 类型 | 接线 |
+|---|---|---|
+| `latent` | LATENT | KSampler 的 `latent_image`（**改图链不接 EmptyLatentImage**，Params 的 width/height/batch 三口悬空不消费） |
+| `denoise` | FLOAT | KSampler 的 `denoise` |
+
+`IS_CHANGED` 返回 NaN 绕缓存（改契约 / 换图后无需刷新，下次执行现读）。
+改图链输出张数 = 1（输入图 batch 维固定 1）。
+
+### 官方改图工作流模板（workflows/img2img-template.json）
+
+仓内 [`workflows/img2img-template.json`](workflows/img2img-template.json) 是
+完整的可导入工作流：v1.5.0 六节点（注入 / 生成参数 / LoRA 清单 / 基模 /
+保存图像 / 过滤）+ 改图输入节点 + 原生采样段（CLIP 编码 ×2 / KSampler /
+VAEDecode）的完整接线。使用：
+
+1. ComfyUI 网页 UI 里 **导入**（工作流菜单 → 打开/导入该文件，或直接拖进画布）；
+2. 点一次生成（Queue）——注入节点会上报 `workflow_snapshot.json`，此后
+   编辑器侧「生成前检查 + 原样重提交」链路即接管；
+3. 模板同时是 **fth 侧 `workflow_snapshot.json` 的官方种子**——FeeTagHelper
+   改图面板（阶段 2 起）以本模板为基准快照原样提交，用户也可以在导入后
+   自由改动画布（加 ControlNet 等），点一次生成后新拓扑即成为自己的快照。
+
+### 契约路径裸文件名解析（v1.6.0）
+
+各契约节点的文件路径输入（`params_file` / `lora_file` / `checkpoint_file` /
+`filter_file` / `image_file` / 注入节点的 `path` / `negative_path`）新增
+**裸文件名**写法：只填文件名（如 `params.json`）时自动解析为插件目录下
+同名文件——官方模板因此在**任意安装路径**导入即用，无需手工改路径；
+绝对路径照旧原样使用，旧工作流零迁移。
 
 ## 姊妹项目
 
