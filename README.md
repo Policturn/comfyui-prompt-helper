@@ -139,7 +139,7 @@ v1.5.0 起插件从单节点扩展为**节点群**：配合 FeeTagHelper 编辑�
 | 保存图像·元数据嵌入 | 读+写 | `params.json` / `lora_list.json` / `checkpoint.json` + sidecar；写 `image_manifest.json` | 见下 |
 | 基模加载 | 读 | `checkpoint.json` | `{"name":"xxx.safetensors"}` → 加载输出 model/clip/vae/name |
 | 过滤结果 | 读 | `filter_output.txt` | 逗号拼接保留词条（或含 `kept/removed/total/rules` 统计的 JSON 信封）→ kept_tags / removed_count / total / status |
-| 改图输入·图生图（v1.6.0） | 读 | `image.json` + `images/` | `{"image":"x.png","denoise":0.5}` → LoadImage 语义加载 + VAEEncode，输出 LATENT + denoise 接 KSampler |
+| 改图输入·图生图（v1.6.0） | 读 | `image.json` + `images/` | `{"image":"x.png","denoise":0.5,"scale":1.0}` → LoadImage 语义加载（scale>1 时 LANCZOS 放大 16 倍数边长）+ VAEEncode，输出 LATENT + denoise 接 KSampler |
 
 ### 保存图像·元数据嵌入（PromptHelperImageOutput）
 
@@ -171,7 +171,7 @@ v1.5.0 起插件从单节点扩展为**节点群**：配合 FeeTagHelper 编辑�
 - 采样器 / 调度器名**原样透传**（ComfyUI 原生拼写如 `euler` / `normal`，
   A1111 别名如 `Euler a` 的映射由编辑器写方负责）。
 
-## 改图链 v1.6.0（图生图 img2img，2026-11-03）
+## 改图链 v1.6.0（图生图 img2img，2026-11-03；v1.7.0 增尺寸倍率）
 
 v1.6.0 新增图生图输入段：**改图输入·图生图（PromptHelperImageInput）**节点 +
 `image.json` 独立契约 + 官方工作流模板。设计纪律：**不动 `params.json` 八字段
@@ -183,7 +183,8 @@ v1.6.0 新增图生图输入段：**改图输入·图生图（PromptHelperImageI
 ```json
 {
   "image": "输入图文件名.png",
-  "denoise": 0.5
+  "denoise": 0.5,
+  "scale": 1.0
 }
 ```
 
@@ -192,6 +193,9 @@ v1.6.0 新增图生图输入段：**改图输入·图生图（PromptHelperImageI
   只按 `image` 里的文件名加载（basename 收敛，不取 `images/` 外路径）；
 - `denoise` 契约范围 **0.05 ~ 0.95**（编辑器滑杆范围）：缺失 / 坏值 → 默认
   `0.5`；越界收敛到最近端（如 `1.2` → `0.95`），不报错不拦队列；
+- `scale` 尺寸倍率契约范围 **1.0 ~ 2.0**（编辑器滑杆步进 0.25，v1.7.0）：
+  缺失 / 坏值 → 默认 `1.0`（= v1.6.x 行为，旧契约零迁移）；越界收敛到最近端，
+  不报错不拦队列；
 - **容错口径（与基模加载同款纪律）**：`image.json` 缺失 / 损坏 / 缺 `image`
   字段 / `images/` 里没有该文件 → 节点红字清晰报错，文案指路「fth 侧未写
   image.json 或图未拷贝」——改图没有源图时静默直通（跑成意外噪声图）比
@@ -201,7 +205,10 @@ v1.6.0 新增图生图输入段：**改图输入·图生图（PromptHelperImageI
 ### 改图输入·图生图（PromptHelperImageInput）节点行为
 
 读 `image.json` → **LoadImage 语义**加载 `images/<image>`（EXIF 方向转正 +
-RGB + 0..1 张量，与原生 LoadImage 节点输出同构）→ **VAEEncode**（`vae`
+RGB + 0..1 张量，与原生 LoadImage 节点输出同构）→（`scale > 1.0` 时按倍率
+**LANCZOS 放大**：逐边 round(边长×scale) 取最近 **16 倍数**，再钳制到
+**64 ~ 4096**——超分=尺寸放大的图生图，放大段在 VAEEncode 之前，输出
+latent 即放大后尺寸）→ **VAEEncode**（`vae`
 输入口接基模加载节点的 `vae` 输出——LoRA 不影响 VAE，无需经过 LoRA 清单
 叠加节点）→ 输出两口：
 

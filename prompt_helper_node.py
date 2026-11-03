@@ -172,18 +172,29 @@ IMAGE_MANIFEST_PATH = os.path.join(NODE_DIR, "image_manifest.json")        # 取
 IMAGE_MANIFEST_CAP = 500  # 清单条数上限（超出丢最旧，防长期累积无界膨胀；编辑器消费后旧条目无留存价值）
 # ---- v1.6.0（2026-11-03 拍板，改图 Comfy 链计划阶段 1）改图链契约路径 ----
 # 独立新契约（不动 params.json 八字段面）：编辑器改图面板写方。
-IMAGE_JSON_PATH = os.path.join(NODE_DIR, "image.json")   # {"image": "x.png", "denoise": 0.5}
+IMAGE_JSON_PATH = os.path.join(NODE_DIR, "image.json")   # {"image": "x.png", "denoise": 0.5, "scale": 1.0}
 IMAGES_DIR = os.path.join(NODE_DIR, "images")            # 输入图实体目录（编辑器拷贝进来，节点按名加载）
 IMAGE_DENOISE_MIN = 0.05     # denoise 契约范围下限（编辑器滑杆 0.05~0.95）
 IMAGE_DENOISE_MAX = 0.95     # denoise 契约范围上限
 IMAGE_DENOISE_DEFAULT = 0.5  # denoise 缺失 / 坏值默认（换装档）
+# v1.7.0（2026-11-04）：尺寸倍率（scale）契约域——超分=尺寸放大的图生图。编辑器滑杆
+# 1.0~2.0 步进 0.25；节点侧按倍率 LANCZOS 放大像素后边长取 16 倍数（VAE 友好），
+# 再整体钳制到 [64, 4096]（显存护栏）。越界收敛不报错（denoise 同纪律）。
+IMAGE_SCALE_MIN = 1.0        # scale 契约范围下限（1.0=原尺寸不放大）
+IMAGE_SCALE_MAX = 2.0        # scale 契约范围上限
+IMAGE_SCALE_DEFAULT = 1.0    # scale 缺失 / 坏值默认（=v1.6.x 行为，旧契约零迁移）
+IMAGE_SCALE_SIDE_MIN = 64    # 放大后边长下限（VAE 最小可用边护栏）
+IMAGE_SCALE_SIDE_MAX = 4096  # 放大后边长上限（显存护栏）
+IMAGE_SCALE_SIDE_STEP = 16   # 放大后边长取整步长（16 倍数）
 
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
 # v1.5.0（2026-09-27）：ComfyUI v3 节点群（本仓专属，见模块 docstring）。
 # v1.6.0（2026-11-03）：改图链（img2img）image.json 契约 + ImageInput 节点（本仓专属）。
-PLUGIN_VERSION = "1.6.1"
+# v1.7.0（2026-11-04）：image.json 增 scale（尺寸倍率）字段——ImageInput 按倍率 LANCZOS
+#   放大输入图（边长 16 倍数、64~4096 钳制）后 VAEEncode；超分=尺寸放大的图生图。
+PLUGIN_VERSION = "1.7.0"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -547,34 +558,70 @@ def _clamp_denoise(value):
     return min(IMAGE_DENOISE_MAX, max(IMAGE_DENOISE_MIN, denoise))
 
 
+def _clamp_scale(value):
+    """scale 规范化（v1.7.0，denoise 同纪律）：宽松 float 强转，坏值 / 缺失 /
+    NaN → 默认 1.0（=不放大，v1.6.x 行为）；越界收敛到 [1.0, 2.0]（编辑器
+    尺寸倍率滑杆的契约范围），不报错不拦队列。"""
+    scale = _to_float(value, IMAGE_SCALE_DEFAULT)
+    if not scale == scale:  # NaN 与任何值不等 → 视作坏值
+        scale = IMAGE_SCALE_DEFAULT
+    return min(IMAGE_SCALE_MAX, max(IMAGE_SCALE_MIN, scale))
+
+
+def _scaled_size(width, height, scale):
+    """放大目标尺寸（v1.7.0）：逐边 round(边长×scale) 后取 16 倍数（最近倍数——
+    超分输出边长对 VAE/采样器友好），再钳制到 [64, 4096]（显存/最小可用边护栏）。
+    纯整数运算无 PIL 依赖（离线自测可直测）。scale<=1.0 时调用方不放大（原尺寸
+    直通，本函数不被调用）。"""
+    def side(v):
+        snapped = int(round(float(v) * scale / IMAGE_SCALE_SIDE_STEP)) * IMAGE_SCALE_SIDE_STEP
+        return min(IMAGE_SCALE_SIDE_MAX, max(IMAGE_SCALE_SIDE_MIN, snapped))
+    return side(width), side(height)
+
+
 def _read_image_contract(image_file):
     """读 image.json（改图契约，编辑器改图面板写方）。返回 (文件名或 None,
-    denoise 或 None, 错误消息)。契约形状 {"image": "x.png", "denoise": 0.5}：
-    image 只取 basename（fth 拷贝实体进 images/，节点只按名加载——目录穿越 /
-    跨目录引用一律收敛回 images/ 内）；denoise 走 _clamp_denoise 规范化。
-    文件缺失 / 损坏 / 顶层非对象 / 缺 image 字段 → (None, None, 错误消息)
+    denoise 或 None, scale 或 None, 错误消息)。契约形状
+    {"image": "x.png", "denoise": 0.5, "scale": 1.0}：image 只取 basename
+    （fth 拷贝实体进 images/，节点只按名加载——目录穿越 / 跨目录引用一律收敛回
+    images/ 内）；denoise 走 _clamp_denoise、scale 走 _clamp_scale 规范化。
+    文件缺失 / 损坏 / 顶层非对象 / 缺 image 字段 → (None, None, None, 错误消息)
     ——调用方 RuntimeError（改图无源图不可静默直通，与 Checkpoint 同款纪律）；
     表外未知字段容忍忽略。"""
     data, err = _read_json_file(image_file, dict)
     if data is None:
-        return None, None, err
+        return None, None, None, err
     name = os.path.basename(str(data.get("image") or "").strip().strip('"').strip("'"))
     if not name:
-        return None, None, "未指定输入图（image.json 的 image 字段缺失或为空）"
-    return name, _clamp_denoise(data.get("denoise")), ""
+        return None, None, None, "未指定输入图（image.json 的 image 字段缺失或为空）"
+    return name, _clamp_denoise(data.get("denoise")), _clamp_scale(data.get("scale")), ""
 
 
-def _load_image_pixels(image_path):
-    """LoadImage 语义加载（v1.6.0）：PIL 打开 → EXIF 方向转正 → RGB（丢
-    alpha）→ float32 / 255 → torch 张量 [1, H, W, C]（0..1，与 ComfyUI
-    LoadImage 节点输出同构，可直接喂 VAE.encode）。PIL / numpy / torch 均
-    方法内导入（保持模块导入期纯标准库，无 ComfyUI 环境也能加载本模块）。"""
+def _load_image_pil(image_path):
+    """PIL 加载段（v1.7.0 自 _load_image_pixels 拆出）：打开 → EXIF 方向转正 →
+    RGB（丢 alpha）。放大段（LANCZOS）在返回后按 scale 另行施加，scale<=1.0
+    零重采样（v1.6.x 行为逐像素一致）。"""
     from PIL import Image, ImageOps
+    with Image.open(image_path) as img:
+        return ImageOps.exif_transpose(img).convert("RGB")
+
+
+def _load_image_pixels(image_path, scale=IMAGE_SCALE_DEFAULT):
+    """LoadImage 语义加载（v1.6.0；v1.7.0 增 scale 放大段）：PIL 打开 → EXIF
+    方向转正 → RGB（丢 alpha）→（scale>1.0 时 LANCZOS 放大到 16 倍数边长，
+    clamp 64~4096——超分=尺寸放大的图生图）→ float32 / 255 → torch 张量
+    [1, H, W, C]（0..1，与 ComfyUI LoadImage 节点输出同构，可直接喂 VAE.encode）。
+    PIL / numpy / torch 均方法内导入（保持模块导入期纯标准库，无 ComfyUI
+    环境也能加载本模块）。"""
     import numpy
     import torch
-    with Image.open(image_path) as img:
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        array = numpy.array(img).astype("float32") / 255.0
+    img = _load_image_pil(image_path)
+    if scale > IMAGE_SCALE_MIN:
+        from PIL import Image as _Image
+        w, h = _scaled_size(img.width, img.height, scale)
+        resample = getattr(getattr(_Image, "Resampling", _Image), "LANCZOS")
+        img = img.resize((w, h), resample)
+    array = numpy.array(img).astype("float32") / 255.0
     return torch.from_numpy(array).unsqueeze(0)
 
 
@@ -1323,17 +1370,18 @@ class PromptHelperFilter:
 
 
 class PromptHelperImageInput:
-    """读编辑器改图契约 image.json（{"image": 文件名, "denoise": 0.05~0.95}），
-    LoadImage 语义加载插件 images/ 子目录的输入图 → VAEEncode → 输出
-    LATENT + denoise 两口（接 KSampler.latent_image / denoise）——图生图链
-    的输入段适配器（v1.6.0，改图 Comfy 链计划阶段 1）。
+    """读编辑器改图契约 image.json（{"image": 文件名, "denoise": 0.05~0.95,
+    "scale": 1.0~2.0}），LoadImage 语义加载插件 images/ 子目录的输入图 →
+    （scale>1.0 时 LANCZOS 放大：边长 16 倍数、clamp 64~4096——v1.7.0 超分段）→
+    VAEEncode → 输出 LATENT + denoise 两口（接 KSampler.latent_image / denoise）
+    ——图生图链的输入段适配器（v1.6.0，改图 Comfy 链计划阶段 1）。
 
     输入图实体由编辑器（fth 侧）拷贝进插件 images/ 子目录，节点侧只按
     image.json 里的文件名加载（basename 收敛，不取 images/ 外路径）。
     容错口径（与 Checkpoint 同款纪律——改图无源图不可静默直通）：image.json
     缺失 / 损坏 / 缺 image 字段 / images/ 无该文件 → RuntimeError 清晰报错，
-    文案指路「fth 侧未写 image.json 或图未拷贝」；denoise 缺失 / 坏值 →
-    默认 0.5，越界收敛到 [0.05, 0.95]（不报错不拦队列）。"""
+    文案指路「fth 侧未写 image.json 或图未拷贝」；denoise / scale 缺失 / 坏值 →
+    分别默认 0.5 / 1.0，越界收敛到各自契约域（不报错不拦队列）。"""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1345,7 +1393,7 @@ class PromptHelperImageInput:
                 "image_file": ("STRING", {
                     "default": IMAGE_JSON_PATH,
                     "multiline": False,
-                    "tooltip": "改图契约 JSON（编辑器改图面板写方）：{\"image\":\"x.png\",\"denoise\":0.5}；"
+                    "tooltip": "改图契约 JSON（编辑器改图面板写方）：{\"image\":\"x.png\",\"denoise\":0.5,\"scale\":1.0}；"
                                "输入图实体放插件目录 images/ 子目录；缺失/图未拷贝时报错",
                 }),
             },
@@ -1355,7 +1403,7 @@ class PromptHelperImageInput:
     RETURN_NAMES = ("latent", "denoise")
     FUNCTION = "load"
     CATEGORY = "prompt-helper"
-    DESCRIPTION = "读外部改图契约 JSON：输入图 → LATENT + 重绘幅度（prompt-helper 桥接节点）"
+    DESCRIPTION = "读外部改图契约 JSON：输入图（可按倍率放大）→ LATENT + 重绘幅度（prompt-helper 桥接节点）"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -1363,7 +1411,7 @@ class PromptHelperImageInput:
 
     def load(self, vae, image_file):
         image_file = _resolve_contract_path(image_file)  # 裸文件名 → 插件目录
-        name, denoise, err = _read_image_contract(image_file)
+        name, denoise, scale, err = _read_image_contract(image_file)
         if name is None:
             # 不可安全默认：改图无源图静默直通比报错更糟（会跑成意外噪声图）
             raise RuntimeError(
@@ -1375,13 +1423,17 @@ class PromptHelperImageInput:
                 f"prompt-helper 改图输入图不存在：{image_path}"
                 "（fth 侧未拷贝图——改图输入图实体须放插件 images/ 子目录，"
                 "请在 FeeTagHelper 改图面板重新选图）")
-        pixels = _load_image_pixels(image_path)
+        pixels = _load_image_pixels(image_path, scale)
         # v1.6.1（阶段 3 真机实锤）：VAE.encode() 返回裸张量，LATENT 口须 {"samples": t}
         # 包装（与核心 VAEEncode 节点同款 nodes.py:389）——不包装则 KSampler
         # latent["samples"] 对 4 维张量字符串取下标直接 IndexError 拦链。
         t = vae.encode(pixels[:, :, :, :3])  # VAEEncode 语义（alpha 已在加载层丢弃，切片兜底）
         latent = {"samples": t}
-        _log(f"改图输入已加载：{name} → {pixels.shape[1]}x{pixels.shape[2]}，denoise={denoise:g}")
+        if scale > IMAGE_SCALE_MIN:
+            _log(f"改图输入已加载：{name} → {pixels.shape[1]}x{pixels.shape[2]}"
+                 f"（×{scale:g} 放大，16 倍数取整），denoise={denoise:g}")
+        else:
+            _log(f"改图输入已加载：{name} → {pixels.shape[1]}x{pixels.shape[2]}，denoise={denoise:g}")
         return (latent, denoise)
 
 
