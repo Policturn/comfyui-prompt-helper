@@ -107,6 +107,16 @@ image.json 缺失 / 损坏 / 缺 image 字段 / images/ 无该文件 → 清晰�
 任意安装路径导入，绝对路径行为不变（向后兼容）。④官方改图工作流模板
 workflows/img2img-template.json：六节点 + ImageInput + 原生采样段完整接线，
 ComfyUI 网页可直接导入；同时是编辑器侧 workflow_snapshot.json 的官方种子。
+
+v1.6.1（2026-11-03，改图链阶段 3 真机 E2E 实锤）修 Params→KSampler 连线在
+ComfyUI 0.32 的校验拦截：sampler / scheduler 输出类型由 "STRING" 改为与原生
+KSampler 输入同源的选项列表（comfy.samplers.SAMPLER_NAMES / SCHEDULER_NAMES——KSampler.sampler_name 用 SAMPLER_NAMES（44 项含 ddim/uni_pc，非 KSAMPLER_NAMES 41 项，逐项不同即判失配——实测二修）。
+校验层（comfy_execution/validation.py）对 STRING→COMBO 连线判
+return_type_mismatch 拦链，received==input 全等或 list 才放行；列表与 KSampler
+输入列表同源 → 全等放行。运行时值不变（仍输出 params.json 的字符串），旧工作流
+（widget 值不经本节点连线）零影响。②ImageInput latent 输出口补 {"samples": t}
+包装：本版 VAE.encode() 返回裸张量（核心 VAEEncode 节点才做 LATENT 包装），
+不包装则 KSampler 取 latent["samples"] IndexError 拦链。
 """
 
 import base64
@@ -118,6 +128,19 @@ import re
 import subprocess
 import threading
 import time
+
+# v1.6.1：Params 组合输出类型须与原生 KSampler 输入**同源列表**（校验层全等放行，见
+# 类定义处注释）。离线自测（test_prompt_helper.py）无 ComfyUI 环境——导入缺席时用
+# 静态回落表（仅结构同形；离线模式不过服务端校验，值不参与比对）。
+try:
+    import comfy.samplers as comfy_samplers
+    _SAMPLER_TYPE = comfy_samplers.SAMPLER_NAMES
+    _SCHEDULER_TYPE = comfy_samplers.SCHEDULER_NAMES
+except Exception:  # 离线自测环境
+    _SAMPLER_TYPE = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde",
+                     "ddim", "uni_pc", "lcm", "heun", "dpm_2", "dpm_2_ancestral"]
+    _SCHEDULER_TYPE = ["normal", "karras", "exponential", "sgm_uniform", "simple",
+                       "ddim_uniform", "beta", "linear_quadratic"]
 
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
@@ -160,7 +183,7 @@ IMAGE_DENOISE_DEFAULT = 0.5  # denoise 缺失 / 坏值默认（换装档）
 # 仅共享函数面，inject 语义不变。
 # v1.5.0（2026-09-27）：ComfyUI v3 节点群（本仓专属，见模块 docstring）。
 # v1.6.0（2026-11-03）：改图链（img2img）image.json 契约 + ImageInput 节点（本仓专属）。
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -1079,7 +1102,10 @@ class PromptHelperParams:
             },
         }
 
-    RETURN_TYPES = ("INT", "INT", "FLOAT", "STRING", "STRING", "INT", "INT", "INT")
+    # v1.6.1：sampler/scheduler 输出类型 = 原生 KSampler 输入同源选项列表（STRING→COMBO
+    # 连线被 0.32 校验层拦 return_type_mismatch——同源列表全等放行；运行时值不变）
+    RETURN_TYPES = ("INT", "INT", "FLOAT", _SAMPLER_TYPE, _SCHEDULER_TYPE,
+                    "INT", "INT", "INT")
     RETURN_NAMES = ("seed", "steps", "cfg", "sampler", "scheduler", "width", "height", "batch")
     FUNCTION = "load"
     CATEGORY = "prompt-helper"
@@ -1350,7 +1376,11 @@ class PromptHelperImageInput:
                 "（fth 侧未拷贝图——改图输入图实体须放插件 images/ 子目录，"
                 "请在 FeeTagHelper 改图面板重新选图）")
         pixels = _load_image_pixels(image_path)
-        latent = vae.encode(pixels[:, :, :, :3])  # VAEEncode 语义（alpha 已在加载层丢弃，切片兜底）
+        # v1.6.1（阶段 3 真机实锤）：VAE.encode() 返回裸张量，LATENT 口须 {"samples": t}
+        # 包装（与核心 VAEEncode 节点同款 nodes.py:389）——不包装则 KSampler
+        # latent["samples"] 对 4 维张量字符串取下标直接 IndexError 拦链。
+        t = vae.encode(pixels[:, :, :, :3])  # VAEEncode 语义（alpha 已在加载层丢弃，切片兜底）
+        latent = {"samples": t}
         _log(f"改图输入已加载：{name} → {pixels.shape[1]}x{pixels.shape[2]}，denoise={denoise:g}")
         return (latent, denoise)
 

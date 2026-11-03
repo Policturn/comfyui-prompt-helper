@@ -855,19 +855,20 @@ mod.IMAGES_DIR = IMAGES_TMP
 
 
 class _MockVAE:
-    """记录喂进 encode 的张量（形状/数值），返回假 LATENT dict。"""
+    """记录喂进 encode 的张量（形状/数值），返回假张量（v1.6.1 起 VAE.encode 返
+    裸张量、LATENT dict 包装在节点层——核心 VAEEncode 节点同款语义）。"""
     def __init__(self):
         self.fed = []
 
     def encode(self, pixels):
         self.fed.append(pixels.clone())
-        return {"samples": f"LATENT:{tuple(pixels.shape)}"}
+        return f"LATENT:{tuple(pixels.shape)}"
 
 
 _write(img_json, json.dumps({"image": "a.png", "denoise": 0.7}))
 vae = _MockVAE()
 latent, denoise = imgin_cls().load(vae, img_json)
-check("LATENT 来自 VAE.encode 输出（VAEEncode 语义）",
+check("LATENT = {\"samples\": encode 裸张量包装}（v1.6.1，核心 VAEEncode 同款）",
       latent == {"samples": "LATENT:(1, 8, 6, 3)"} and len(vae.fed) == 1)
 px = vae.fed[0]
 check("LoadImage 语义张量：[1,H,W,C] float32 0..1（H=8 W=6，EXIF 转正后宽高不换位）",
