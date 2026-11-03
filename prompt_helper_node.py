@@ -88,6 +88,35 @@ Filter（filter_output.txt 过滤结果）。Inject 节点增强：hidden PROMPT
 容错口径：LoraStack/Params/Filter 契约文件缺失损坏 → 安全默认直通（日志
 定位）；Checkpoint → 清晰报错（基模不可静默默认）；ImageOutput 各元数据源
 缺席 → 对应 parameters 段省略，保存本体不受影响。
+
+v1.6.0（2026-11-03 拍板，改图 Comfy 链计划阶段 1，本仓专属——WebUI 版无
+对应机制零改动）新增图生图（img2img）输入段：①新契约 image.json
+{"image": 文件名, "denoise": 0.05~0.95}（独立文件，不动 params.json 八字段
+面与 Params 节点 8 输出口——typed 输出面加键 = 旧工作流连线要重接）；输入
+图实体放插件目录 images/ 子目录（编辑器写方负责拷贝进来，节点侧只按文件名
+加载，不取目录外路径）。②新节点 ImageInput：读 image.json → LoadImage
+语义加载 images/<image>（EXIF 转正 + RGB + 0..1 张量）→ VAEEncode（接
+Checkpoint 节点出的 VAE）→ 输出 LATENT + FLOAT(denoise) 两口，分别接
+KSampler.latent_image / denoise；IS_CHANGED=NaN 绕缓存同款。容错口径：
+image.json 缺失 / 损坏 / 缺 image 字段 / images/ 无该文件 → 清晰报错
+（改图无源图不可静默直通，与 Checkpoint 缺文件同款纪律，报错文案指路
+「fth 侧未写 image.json 或图未拷贝」）；denoise 缺失 / 坏值 → 默认 0.5，
+越界收敛到 [0.05, 0.95]（编辑器滑杆契约范围）。③契约路径新增裸文件名解析：
+各契约节点的文件路径输入只填文件名（如 "params.json"）时解析为插件目录下
+同名文件——官方工作流模板（workflows/img2img-template.json）得以零改动在
+任意安装路径导入，绝对路径行为不变（向后兼容）。④官方改图工作流模板
+workflows/img2img-template.json：六节点 + ImageInput + 原生采样段完整接线，
+ComfyUI 网页可直接导入；同时是编辑器侧 workflow_snapshot.json 的官方种子。
+
+v1.6.1（2026-11-03，改图链阶段 3 真机 E2E 实锤）修 Params→KSampler 连线在
+ComfyUI 0.32 的校验拦截：sampler / scheduler 输出类型由 "STRING" 改为与原生
+KSampler 输入同源的选项列表（comfy.samplers.SAMPLER_NAMES / SCHEDULER_NAMES——KSampler.sampler_name 用 SAMPLER_NAMES（44 项含 ddim/uni_pc，非 KSAMPLER_NAMES 41 项，逐项不同即判失配——实测二修）。
+校验层（comfy_execution/validation.py）对 STRING→COMBO 连线判
+return_type_mismatch 拦链，received==input 全等或 list 才放行；列表与 KSampler
+输入列表同源 → 全等放行。运行时值不变（仍输出 params.json 的字符串），旧工作流
+（widget 值不经本节点连线）零影响。②ImageInput latent 输出口补 {"samples": t}
+包装：本版 VAE.encode() 返回裸张量（核心 VAEEncode 节点才做 LATENT 包装），
+不包装则 KSampler 取 latent["samples"] IndexError 拦链。
 """
 
 import base64
@@ -99,6 +128,19 @@ import re
 import subprocess
 import threading
 import time
+
+# v1.6.1：Params 组合输出类型须与原生 KSampler 输入**同源列表**（校验层全等放行，见
+# 类定义处注释）。离线自测（test_prompt_helper.py）无 ComfyUI 环境——导入缺席时用
+# 静态回落表（仅结构同形；离线模式不过服务端校验，值不参与比对）。
+try:
+    import comfy.samplers as comfy_samplers
+    _SAMPLER_TYPE = comfy_samplers.SAMPLER_NAMES
+    _SCHEDULER_TYPE = comfy_samplers.SCHEDULER_NAMES
+except Exception:  # 离线自测环境
+    _SAMPLER_TYPE = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_3m_sde",
+                     "ddim", "uni_pc", "lcm", "heun", "dpm_2", "dpm_2_ancestral"]
+    _SCHEDULER_TYPE = ["normal", "karras", "exponential", "sgm_uniform", "simple",
+                       "ddim_uniform", "beta", "linear_quadratic"]
 
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
@@ -128,12 +170,20 @@ FILTER_OUTPUT_PATH = os.path.join(NODE_DIR, "filter_output.txt")  # 过滤页实
 WORKFLOW_SNAPSHOT_PATH = os.path.join(NODE_DIR, "workflow_snapshot.json")  # API 格式工作流图
 IMAGE_MANIFEST_PATH = os.path.join(NODE_DIR, "image_manifest.json")        # 取图清单（追加式）
 IMAGE_MANIFEST_CAP = 500  # 清单条数上限（超出丢最旧，防长期累积无界膨胀；编辑器消费后旧条目无留存价值）
+# ---- v1.6.0（2026-11-03 拍板，改图 Comfy 链计划阶段 1）改图链契约路径 ----
+# 独立新契约（不动 params.json 八字段面）：编辑器改图面板写方。
+IMAGE_JSON_PATH = os.path.join(NODE_DIR, "image.json")   # {"image": "x.png", "denoise": 0.5}
+IMAGES_DIR = os.path.join(NODE_DIR, "images")            # 输入图实体目录（编辑器拷贝进来，节点按名加载）
+IMAGE_DENOISE_MIN = 0.05     # denoise 契约范围下限（编辑器滑杆 0.05~0.95）
+IMAGE_DENOISE_MAX = 0.95     # denoise 契约范围上限
+IMAGE_DENOISE_DEFAULT = 0.5  # denoise 缺失 / 坏值默认（换装档）
 
 # v1.4.5：镜像统一固定机制 _read_pin_overrides（WebUI v1.4.12 settings.pin 同款
 # 读取语义 + 旧独立 pin 兼容并入），与 v1.4.3 的 negative 镜像同款处理——
 # 仅共享函数面，inject 语义不变。
 # v1.5.0（2026-09-27）：ComfyUI v3 节点群（本仓专属，见模块 docstring）。
-PLUGIN_VERSION = "1.5.0"
+# v1.6.0（2026-11-03）：改图链（img2img）image.json 契约 + ImageInput 节点（本仓专属）。
+PLUGIN_VERSION = "1.6.1"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -473,6 +523,59 @@ def _read_checkpoint_name(checkpoint_file):
     if not name:
         return None, "未指定模型名（checkpoint.json 的 name 为空）"
     return name, ""
+
+
+def _resolve_contract_path(raw):
+    """契约文件路径裸文件名解析（v1.6.0）：输入值 strip 后不含任何目录分隔符
+    （如 "params.json" / "prompt.txt"）→ 解析为插件目录下同名文件；其余
+    （绝对路径 / 含目录的相对路径 / 空串）原样返回、语义零变化。官方工作流
+    模板用裸文件名做契约路径，任意机器 / 任意安装路径导入即指向本机插件
+    目录，无需手工改路径（绝对路径照旧优先，旧工作流零迁移）。"""
+    name = (raw or "").strip().strip('"').strip("'")
+    if name and os.sep not in name and "/" not in name and "\\" not in name:
+        return os.path.join(NODE_DIR, name)
+    return raw
+
+
+def _clamp_denoise(value):
+    """denoise 规范化（v1.6.0）：宽松 float 强转，坏值 / 缺失 → 默认 0.5
+    （换装档）；NaN 防御回落默认；越界收敛到 [0.05, 0.95]（编辑器改图面板
+    滑杆的契约范围——超出滑杆范围的值按最近端收敛，不报错不拦队列）。"""
+    denoise = _to_float(value, IMAGE_DENOISE_DEFAULT)
+    if not denoise == denoise:  # NaN 与任何值不等 → 视作坏值
+        denoise = IMAGE_DENOISE_DEFAULT
+    return min(IMAGE_DENOISE_MAX, max(IMAGE_DENOISE_MIN, denoise))
+
+
+def _read_image_contract(image_file):
+    """读 image.json（改图契约，编辑器改图面板写方）。返回 (文件名或 None,
+    denoise 或 None, 错误消息)。契约形状 {"image": "x.png", "denoise": 0.5}：
+    image 只取 basename（fth 拷贝实体进 images/，节点只按名加载——目录穿越 /
+    跨目录引用一律收敛回 images/ 内）；denoise 走 _clamp_denoise 规范化。
+    文件缺失 / 损坏 / 顶层非对象 / 缺 image 字段 → (None, None, 错误消息)
+    ——调用方 RuntimeError（改图无源图不可静默直通，与 Checkpoint 同款纪律）；
+    表外未知字段容忍忽略。"""
+    data, err = _read_json_file(image_file, dict)
+    if data is None:
+        return None, None, err
+    name = os.path.basename(str(data.get("image") or "").strip().strip('"').strip("'"))
+    if not name:
+        return None, None, "未指定输入图（image.json 的 image 字段缺失或为空）"
+    return name, _clamp_denoise(data.get("denoise")), ""
+
+
+def _load_image_pixels(image_path):
+    """LoadImage 语义加载（v1.6.0）：PIL 打开 → EXIF 方向转正 → RGB（丢
+    alpha）→ float32 / 255 → torch 张量 [1, H, W, C]（0..1，与 ComfyUI
+    LoadImage 节点输出同构，可直接喂 VAE.encode）。PIL / numpy / torch 均
+    方法内导入（保持模块导入期纯标准库，无 ComfyUI 环境也能加载本模块）。"""
+    from PIL import Image, ImageOps
+    import numpy
+    import torch
+    with Image.open(image_path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        array = numpy.array(img).astype("float32") / 255.0
+    return torch.from_numpy(array).unsqueeze(0)
 
 
 def _parse_filter_output(text):
@@ -871,6 +974,9 @@ class PromptHelperInject:
     def inject(self, path, negative_path, base_prompt, negative_base_prompt, position, merge_lines, **hidden):
         # v1.4.1 起注入位置确定化：恒定拼接在最前，position 仅为兼容旧工作流保留、取值被忽略
         # v1.5.0 工作流上报：hidden PROMPT 落盘快照，失败 / 缺席不影响注入（零回归）
+        # v1.6.0 裸文件名解析：path / negative_path 只填文件名时指向插件目录（空串语义不变=不注入）
+        path = _resolve_contract_path(path)
+        negative_path = _resolve_contract_path(negative_path)
         if _write_workflow_snapshot(hidden.get("prompt")):
             _log(f"工作流快照已写入：{WORKFLOW_SNAPSHOT_PATH}")
         prompt_out, tags_out, pos_status = base_prompt or "", "", ""
@@ -954,6 +1060,7 @@ class PromptHelperLoraStack:
         return float("NaN")  # 文件内容实时变化，绕过缓存每次重读
 
     def apply_loras(self, model, clip, lora_file):
+        lora_file = _resolve_contract_path(lora_file)  # v1.6.0 裸文件名 → 插件目录
         entries, err = _read_lora_list(lora_file)
         if err:
             # 安全默认：清单缺失 / 损坏 → 直通 model/clip、count=0（队列不中断）
@@ -995,7 +1102,10 @@ class PromptHelperParams:
             },
         }
 
-    RETURN_TYPES = ("INT", "INT", "FLOAT", "STRING", "STRING", "INT", "INT", "INT")
+    # v1.6.1：sampler/scheduler 输出类型 = 原生 KSampler 输入同源选项列表（STRING→COMBO
+    # 连线被 0.32 校验层拦 return_type_mismatch——同源列表全等放行；运行时值不变）
+    RETURN_TYPES = ("INT", "INT", "FLOAT", _SAMPLER_TYPE, _SCHEDULER_TYPE,
+                    "INT", "INT", "INT")
     RETURN_NAMES = ("seed", "steps", "cfg", "sampler", "scheduler", "width", "height", "batch")
     FUNCTION = "load"
     CATEGORY = "prompt-helper"
@@ -1006,6 +1116,7 @@ class PromptHelperParams:
         return float("NaN")
 
     def load(self, params_file):
+        params_file = _resolve_contract_path(params_file)  # v1.6.0 裸文件名 → 插件目录
         params, err = _read_params(params_file)
         if err:
             # 安全默认：缺失 / 损坏 → 全默认值（工作流仍可跑）
@@ -1148,6 +1259,7 @@ class PromptHelperCheckpoint:
         return float("NaN")
 
     def load(self, checkpoint_file):
+        checkpoint_file = _resolve_contract_path(checkpoint_file)  # v1.6.0 裸文件名 → 插件目录
         name, err = _read_checkpoint_name(checkpoint_file)
         if name is None:
             # 不可安全默认：基模缺席静默换模型出图比报错更糟——节点红字清晰报错
@@ -1197,6 +1309,7 @@ class PromptHelperFilter:
         return float("NaN")
 
     def read(self, filter_file):
+        filter_file = _resolve_contract_path(filter_file)  # v1.6.0 裸文件名 → 插件目录
         path = _normalize_path(filter_file)
         text, message = read_tag_file(path) if path else (None, "未设置文件路径")
         if text is None:
@@ -1209,6 +1322,69 @@ class PromptHelperFilter:
         return (kept, removed, total, status)
 
 
+class PromptHelperImageInput:
+    """读编辑器改图契约 image.json（{"image": 文件名, "denoise": 0.05~0.95}），
+    LoadImage 语义加载插件 images/ 子目录的输入图 → VAEEncode → 输出
+    LATENT + denoise 两口（接 KSampler.latent_image / denoise）——图生图链
+    的输入段适配器（v1.6.0，改图 Comfy 链计划阶段 1）。
+
+    输入图实体由编辑器（fth 侧）拷贝进插件 images/ 子目录，节点侧只按
+    image.json 里的文件名加载（basename 收敛，不取 images/ 外路径）。
+    容错口径（与 Checkpoint 同款纪律——改图无源图不可静默直通）：image.json
+    缺失 / 损坏 / 缺 image 字段 / images/ 无该文件 → RuntimeError 清晰报错，
+    文案指路「fth 侧未写 image.json 或图未拷贝」；denoise 缺失 / 坏值 →
+    默认 0.5，越界收敛到 [0.05, 0.95]（不报错不拦队列）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": ("VAE", {
+                    "tooltip": "接基模加载 (prompt-helper) 节点的 vae 输出（VAEEncode 用，LoRA 不影响 VAE）",
+                }),
+                "image_file": ("STRING", {
+                    "default": IMAGE_JSON_PATH,
+                    "multiline": False,
+                    "tooltip": "改图契约 JSON（编辑器改图面板写方）：{\"image\":\"x.png\",\"denoise\":0.5}；"
+                               "输入图实体放插件目录 images/ 子目录；缺失/图未拷贝时报错",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "FLOAT")
+    RETURN_NAMES = ("latent", "denoise")
+    FUNCTION = "load"
+    CATEGORY = "prompt-helper"
+    DESCRIPTION = "读外部改图契约 JSON：输入图 → LATENT + 重绘幅度（prompt-helper 桥接节点）"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")  # 契约与输入图实时变化，绕过缓存每次重读
+
+    def load(self, vae, image_file):
+        image_file = _resolve_contract_path(image_file)  # 裸文件名 → 插件目录
+        name, denoise, err = _read_image_contract(image_file)
+        if name is None:
+            # 不可安全默认：改图无源图静默直通比报错更糟（会跑成意外噪声图）
+            raise RuntimeError(
+                f"prompt-helper 改图输入加载失败：{err}"
+                "（fth 侧未写 image.json 或图未拷贝——请在 FeeTagHelper 改图面板选图后再发起改图）")
+        image_path = os.path.join(IMAGES_DIR, name)
+        if not os.path.isfile(image_path):
+            raise RuntimeError(
+                f"prompt-helper 改图输入图不存在：{image_path}"
+                "（fth 侧未拷贝图——改图输入图实体须放插件 images/ 子目录，"
+                "请在 FeeTagHelper 改图面板重新选图）")
+        pixels = _load_image_pixels(image_path)
+        # v1.6.1（阶段 3 真机实锤）：VAE.encode() 返回裸张量，LATENT 口须 {"samples": t}
+        # 包装（与核心 VAEEncode 节点同款 nodes.py:389）——不包装则 KSampler
+        # latent["samples"] 对 4 维张量字符串取下标直接 IndexError 拦链。
+        t = vae.encode(pixels[:, :, :, :3])  # VAEEncode 语义（alpha 已在加载层丢弃，切片兜底）
+        latent = {"samples": t}
+        _log(f"改图输入已加载：{name} → {pixels.shape[1]}x{pixels.shape[2]}，denoise={denoise:g}")
+        return (latent, denoise)
+
+
 NODE_CLASS_MAPPINGS = {
     "PromptHelperInject": PromptHelperInject,
     "PromptHelperLoraStack": PromptHelperLoraStack,
@@ -1216,6 +1392,7 @@ NODE_CLASS_MAPPINGS = {
     "PromptHelperImageOutput": PromptHelperImageOutput,
     "PromptHelperCheckpoint": PromptHelperCheckpoint,
     "PromptHelperFilter": PromptHelperFilter,
+    "PromptHelperImageInput": PromptHelperImageInput,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptHelperInject": "外部提示词注入 (prompt-helper)",
@@ -1224,4 +1401,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptHelperImageOutput": "保存图像·元数据嵌入 (prompt-helper)",
     "PromptHelperCheckpoint": "基模加载 (prompt-helper)",
     "PromptHelperFilter": "过滤结果 (prompt-helper)",
+    "PromptHelperImageInput": "改图输入·图生图 (prompt-helper)",
 }

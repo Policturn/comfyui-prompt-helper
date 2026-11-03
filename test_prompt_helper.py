@@ -16,6 +16,23 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.join(HERE, "prompt_helper_node.py")
 REAL_TXT = r"E:\桌面\AI file\Design file\prompt-helper\prompt.txt"
+if not os.path.isfile(REAL_TXT):
+    # 作者机路径缺席（异机跑测，v1.6.0 起补齐）：回落插件 config.json 指向的
+    # 真实词条文件；仍缺席则生成含 1girl 的临时词条文件——「读真实文件」
+    # 用例在任意机器可跑（后续断言均按文件内容动态计算期望值）。
+    _cfg_txt = ""
+    try:
+        _cfg_txt = str(mod._load_config().get("path") or "")
+    except Exception:
+        _cfg_txt = ""
+    if _cfg_txt and os.path.isfile(_cfg_txt):
+        REAL_TXT = _cfg_txt
+    else:
+        _fixture = tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8")
+        _fixture.write("1girl, smile, dress, long hair")
+        _fixture.close()
+        REAL_TXT = _fixture.name
 
 spec = importlib.util.spec_from_file_location("prompt_helper_node", MODULE_PATH)
 mod = importlib.util.module_from_spec(spec)
@@ -485,25 +502,28 @@ os.remove(mod.SETTINGS_PIN_PATH)
 check("拆除全部 pin 后 overrides 复位为空", mod._read_pin_overrides() == {})
 
 print("== v1.5.0 节点群：注册与契约容错 ==")
-check("NODE_CLASS_MAPPINGS 含全部 6 节点",
+check("NODE_CLASS_MAPPINGS 含全部 7 节点（v1.6.0 增 ImageInput）",
       set(mod.NODE_CLASS_MAPPINGS) == {"PromptHelperInject", "PromptHelperLoraStack",
                                        "PromptHelperParams", "PromptHelperImageOutput",
-                                       "PromptHelperCheckpoint", "PromptHelperFilter"})
-check("6 节点显示名全配置",
+                                       "PromptHelperCheckpoint", "PromptHelperFilter",
+                                       "PromptHelperImageInput"})
+check("7 节点显示名全配置",
       set(mod.NODE_CLASS_MAPPINGS) == set(mod.NODE_DISPLAY_NAME_MAPPINGS))
 lora_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperLoraStack"]
 params_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperParams"]
 ckpt_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperCheckpoint"]
 filter_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperFilter"]
 imgout_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperImageOutput"]
-for cls in (lora_cls, params_cls, ckpt_cls, filter_cls):
+imgin_cls = mod.NODE_CLASS_MAPPINGS["PromptHelperImageInput"]
+for cls in (lora_cls, params_cls, ckpt_cls, filter_cls, imgin_cls):
     check(f"{cls.__name__} IS_CHANGED 返回 NaN", cls.IS_CHANGED(x=1) != cls.IS_CHANGED(x=1))
 check("ImageOutput 为 OUTPUT_NODE（执行终点，不吃缓存）", imgout_cls.OUTPUT_NODE is True)
 check("契约文件输入默认值指向插件目录",
       lora_cls.INPUT_TYPES()["required"]["lora_file"][1]["default"] == mod.LORA_LIST_PATH
       and params_cls.INPUT_TYPES()["required"]["params_file"][1]["default"] == mod.PARAMS_PATH
       and ckpt_cls.INPUT_TYPES()["required"]["checkpoint_file"][1]["default"] == mod.CHECKPOINT_PATH
-      and filter_cls.INPUT_TYPES()["required"]["filter_file"][1]["default"] == mod.FILTER_OUTPUT_PATH)
+      and filter_cls.INPUT_TYPES()["required"]["filter_file"][1]["default"] == mod.FILTER_OUTPUT_PATH
+      and imgin_cls.INPUT_TYPES()["required"]["image_file"][1]["default"] == mod.IMAGE_JSON_PATH)
 check("Inject 增加 hidden PROMPT（工作流捕获）",
       node_cls.INPUT_TYPES().get("hidden") == {"prompt": "PROMPT"})
 
@@ -763,5 +783,230 @@ finally:
             sys.modules.pop(_name, None)
         else:
             sys.modules[_name] = _orig
+
+print("== v1.6.0 改图链：契约常量 + 裸文件名解析 ==")
+check("契约常量指向插件目录",
+      mod.IMAGE_JSON_PATH == os.path.join(mod.NODE_DIR, "image.json")
+      and mod.IMAGES_DIR == os.path.join(mod.NODE_DIR, "images"))
+check("denoise 契约范围/默认常量",
+      mod.IMAGE_DENOISE_MIN == 0.05 and mod.IMAGE_DENOISE_MAX == 0.95
+      and mod.IMAGE_DENOISE_DEFAULT == 0.5)
+_rp = mod._resolve_contract_path
+check("裸文件名 → 插件目录同名文件",
+      _rp("params.json") == os.path.join(mod.NODE_DIR, "params.json")
+      and _rp(' "image.json" ') == os.path.join(mod.NODE_DIR, "image.json"))
+check("绝对路径 / 含目录路径 / 空串原样返回（零语义变化）",
+      _rp(params_ok) == params_ok and _rp("") == ""
+      and _rp("sub/dir.json") == "sub/dir.json"
+      and _rp(r"C:\x\y.json") == r"C:\x\y.json")
+
+print("== v1.6.0 image.json 契约解析 + 边界 ==")
+img_json = os.path.join(CT_DIR, "image.json")
+_write(img_json, json.dumps({"image": "a.png", "denoise": 0.5}))
+check("正常解析（文件名 + denoise）", mod._read_image_contract(img_json) == ("a.png", 0.5, ""))
+_write(img_json, json.dumps({"image": "b.png", "extra": 1}))
+check("denoise 缺失 → 默认 0.5；未知字段容忍",
+      mod._read_image_contract(img_json) == ("b.png", 0.5, ""))
+_write(img_json, json.dumps({"image": "b.png", "denoise": "0.3"}))
+check("denoise 字符串宽松强转", mod._read_image_contract(img_json) == ("b.png", 0.3, ""))
+_write(img_json, json.dumps({"image": "b.png", "denoise": "bad"}))
+check("denoise 坏值 → 默认 0.5", mod._read_image_contract(img_json) == ("b.png", 0.5, ""))
+_write(img_json, '{"image": "b.png", "denoise": NaN}')
+check("denoise NaN 防御 → 默认 0.5", mod._read_image_contract(img_json) == ("b.png", 0.5, ""))
+_write(img_json, json.dumps({"image": "b.png", "denoise": 0.06}))
+check("denoise 界内原样", mod._read_image_contract(img_json) == ("b.png", 0.06, ""))
+_write(img_json, json.dumps({"image": "b.png", "denoise": 0.0}))
+check("denoise 越界下限收敛 0.05", mod._read_image_contract(img_json) == ("b.png", 0.05, ""))
+_write(img_json, json.dumps({"image": "b.png", "denoise": 1.2}))
+check("denoise 越界上限收敛 0.95", mod._read_image_contract(img_json) == ("b.png", 0.95, ""))
+_write(img_json, json.dumps({"denoise": 0.5}))
+name, den, err = mod._read_image_contract(img_json)
+check("缺 image 字段 → 报错口径", name is None and den is None and "image" in err)
+_write(img_json, json.dumps({"image": "   "}))
+check("image 空串 → 报错口径", mod._read_image_contract(img_json)[0] is None)
+_write(img_json, json.dumps({"image": "../evil.png"}))
+check("image 目录穿越收敛 basename", mod._read_image_contract(img_json)[0] == "evil.png")
+_write(img_json, json.dumps({"image": r"C:\abs\x.png"}))
+check("image 绝对路径收敛 basename", mod._read_image_contract(img_json)[0] == "x.png")
+name, den, err = mod._read_image_contract(missing_json)
+check("image.json 缺失 → 报错口径", name is None and "不存在" in err)
+_write(img_json, "{broken json")
+check("损坏 JSON → 报错口径", mod._read_image_contract(img_json)[0] is None)
+_write(img_json, "[1, 2]")
+check("顶层数组 → 格式不符报错", "格式不符" in mod._read_image_contract(img_json)[2])
+
+print("== v1.6.0 ImageInput：节点注册 + mock VAE 输出形状 ==")
+check("ImageInput typed 输出面（LATENT + FLOAT 两口）",
+      imgin_cls.RETURN_TYPES == ("LATENT", "FLOAT")
+      and imgin_cls.RETURN_NAMES == ("latent", "denoise"))
+check("ImageInput vae 输入口在 required", "vae" in imgin_cls.INPUT_TYPES()["required"])
+check("显示名已配置", "PromptHelperImageInput" in mod.NODE_DISPLAY_NAME_MAPPINGS)
+
+import numpy as _np2
+import torch as _torch2
+from PIL import Image as _PIL2
+
+IMAGES_TMP = os.path.join(CT_DIR, "images")
+os.makedirs(IMAGES_TMP, exist_ok=True)
+_PIL2.new("RGB", (6, 8), (255, 128, 0)).save(os.path.join(IMAGES_TMP, "a.png"))   # W=6 H=8
+_PIL2.new("RGBA", (6, 8), (0, 0, 0, 255)).save(os.path.join(IMAGES_TMP, "rgba.png"))
+_real_images_dir = mod.IMAGES_DIR
+mod.IMAGES_DIR = IMAGES_TMP
+
+
+class _MockVAE:
+    """记录喂进 encode 的张量（形状/数值），返回假张量（v1.6.1 起 VAE.encode 返
+    裸张量、LATENT dict 包装在节点层——核心 VAEEncode 节点同款语义）。"""
+    def __init__(self):
+        self.fed = []
+
+    def encode(self, pixels):
+        self.fed.append(pixels.clone())
+        return f"LATENT:{tuple(pixels.shape)}"
+
+
+_write(img_json, json.dumps({"image": "a.png", "denoise": 0.7}))
+vae = _MockVAE()
+latent, denoise = imgin_cls().load(vae, img_json)
+check("LATENT = {\"samples\": encode 裸张量包装}（v1.6.1，核心 VAEEncode 同款）",
+      latent == {"samples": "LATENT:(1, 8, 6, 3)"} and len(vae.fed) == 1)
+px = vae.fed[0]
+check("LoadImage 语义张量：[1,H,W,C] float32 0..1（H=8 W=6，EXIF 转正后宽高不换位）",
+      tuple(px.shape) == (1, 8, 6, 3) and px.dtype == _torch2.float32
+      and abs(float(px.max()) - 1.0) < 1e-6 and float(px.min()) >= 0.0
+      and abs(float(px[0, 0, 0, 0]) - 1.0) < 1e-6)   # 左上白像素 → 1.0
+check("denoise typed 透传", denoise == 0.7)
+_write(img_json, json.dumps({"image": "rgba.png"}))
+vae2 = _MockVAE()
+_, denoise2 = imgin_cls().load(vae2, img_json)
+check("RGBA 输入图丢 alpha 成 3 通道 + denoise 缺省 0.5",
+      tuple(vae2.fed[0].shape) == (1, 8, 6, 3) and denoise2 == 0.5
+      and abs(float(vae2.fed[0][0, 0, 0, 0])) < 1e-6)  # 黑像素 → 0.0
+_write(img_json, json.dumps({"image": "a.png", "denoise": 1.2}))
+check("节点层 denoise 越界收敛（1.2 → 0.95）", imgin_cls().load(_MockVAE(), img_json)[1] == 0.95)
+
+print("== v1.6.0 ImageInput：报错纪律（不静默直通） ==")
+
+
+def _expect_runtime(label, call, *kw):
+    try:
+        call(*kw)
+        raise SystemExit("应当 RuntimeError：" + label)
+    except RuntimeError as e:
+        check(label, "prompt-helper" in str(e))
+
+
+_expect_runtime("image.json 缺失 → RuntimeError 指路 fth 写方",
+                lambda *a: imgin_cls().load(*a), _MockVAE(), missing_json)
+_write(img_json, json.dumps({"image": "nope.png", "denoise": 0.5}))
+_expect_runtime("images/ 无该文件 → RuntimeError 指路图未拷贝",
+                lambda *a: imgin_cls().load(*a), _MockVAE(), img_json)
+_write(img_json, json.dumps({"denoise": 0.5}))
+_expect_runtime("缺 image 字段 → RuntimeError",
+                lambda *a: imgin_cls().load(*a), _MockVAE(), img_json)
+_write(img_json, "{broken")
+_expect_runtime("损坏 JSON → RuntimeError",
+                lambda *a: imgin_cls().load(*a), _MockVAE(), img_json)
+open(os.path.join(CT_DIR, "secret.png"), "wb").close()
+_write(img_json, json.dumps({"image": "../secret.png"}))
+try:
+    imgin_cls().load(_MockVAE(), img_json)
+    raise SystemExit("应当 RuntimeError（目录穿越）")
+except RuntimeError as e:
+    check("目录穿越不逃出 images/（../secret.png 收敛到 images/secret.png → 不存在报错）",
+          os.path.join(IMAGES_TMP, "secret.png") in str(e))
+os.remove(os.path.join(CT_DIR, "secret.png"))
+
+print("== v1.6.0 裸文件名端到端（官方模板零改动可移植的机制）==")
+_real_node_dir = mod.NODE_DIR
+mod.NODE_DIR = CT_DIR
+try:
+    _write(os.path.join(CT_DIR, "params.json"),
+           json.dumps({"seed": 42, "steps": 28, "cfg": 5.5, "sampler": "dpmpp_2m",
+                       "scheduler": "karras", "width": 832, "height": 1216, "batch": 1}))
+    check("Params 节点裸文件名 'params.json' → 插件目录（CT_DIR 重定向）",
+          params_cls().load("params.json") == (42, 28, 5.5, "dpmpp_2m", "karras", 832, 1216, 1))
+    _write(os.path.join(CT_DIR, "prompt.txt"), "bare_tag")
+    check("Inject 节点裸文件名 'prompt.txt' 注入生效、空反向语义不变",
+          node.inject("prompt.txt", "", "base", "", "追加到末尾", True)[0] == "bare_tag, base")
+    _write(img_json, json.dumps({"image": "a.png", "denoise": 0.6}))
+    latent_bare, denoise_bare = imgin_cls().load(_MockVAE(), "image.json")
+    check("ImageInput 节点裸文件名 'image.json' 端到端", denoise_bare == 0.6)
+finally:
+    mod.NODE_DIR = _real_node_dir
+mod.IMAGES_DIR = _real_images_dir
+
+print("== v1.6.0 官方改图模板 workflows/img2img-template.json ==")
+TPL = os.path.join(HERE, "workflows", "img2img-template.json")
+wf = json.load(open(TPL, encoding="utf-8"))
+tpl_nodes = {n["id"]: n for n in wf["nodes"]}
+tpl_links = {l[0]: l for l in wf["links"]}
+check("模板存在且 JSON 可解析 + 版本 0.4", wf.get("version") == 0.4)
+_tpl_types = [n["type"] for n in wf["nodes"]]
+check("节点齐备（7 插件节点 + KSampler/CLIPTextEncode×2/VAEDecode）",
+      {"PromptHelperInject", "PromptHelperParams", "PromptHelperLoraStack", "PromptHelperCheckpoint",
+       "PromptHelperImageOutput", "PromptHelperFilter", "PromptHelperImageInput",
+       "KSampler", "CLIPTextEncode", "VAEDecode"} <= set(_tpl_types))
+check("无 EmptyLatentImage（改图 latent 来自 ImageInput）", "EmptyLatentImage" not in _tpl_types)
+
+
+def _tpl_src(nid, inp):
+    _n = tpl_nodes[nid]
+    _lid = next(i["link"] for i in _n["inputs"] if i["name"] == inp)
+    _l = tpl_links[_lid]
+    return tpl_nodes[_l[1]]["type"], tpl_nodes[_l[1]]["outputs"][_l[2]]["name"]
+
+
+_tpl_ks = next(n["id"] for n in wf["nodes"] if n["type"] == "KSampler")
+check("KSampler.latent_image ← ImageInput.latent（Params 的 latent 尺寸路不接）",
+      _tpl_src(_tpl_ks, "latent_image") == ("PromptHelperImageInput", "latent"))
+check("KSampler.denoise ← ImageInput.denoise（FLOAT 口）",
+      _tpl_src(_tpl_ks, "denoise") == ("PromptHelperImageInput", "denoise"))
+check("KSampler 五采样参数 ← Params 五口（seed/steps/cfg/sampler/scheduler）",
+      all(_tpl_src(_tpl_ks, k) == ("PromptHelperParams", v) for k, v in
+          (("seed", "seed"), ("steps", "steps"), ("cfg", "cfg"),
+           ("sampler_name", "sampler"), ("scheduler", "scheduler"))))
+check("KSampler.model ← LoraStack.model；正负条件 ← 两个 CLIP 编码",
+      _tpl_src(_tpl_ks, "model") == ("PromptHelperLoraStack", "model")
+      and _tpl_src(_tpl_ks, "positive")[0] == "CLIPTextEncode"
+      and _tpl_src(_tpl_ks, "negative")[0] == "CLIPTextEncode")
+_tpl_imgin = next(n["id"] for n in wf["nodes"] if n["type"] == "PromptHelperImageInput")
+check("ImageInput.vae ← Checkpoint.vae（LoRA 不影响 VAE）",
+      _tpl_src(_tpl_imgin, "vae") == ("PromptHelperCheckpoint", "vae"))
+_tpl_out = next(n["id"] for n in wf["nodes"] if n["type"] == "PromptHelperImageOutput")
+check("ImageOutput：image ← VAEDecode、正负提示词 ← Inject 两口",
+      _tpl_src(_tpl_out, "image") == ("VAEDecode", "IMAGE")
+      and _tpl_src(_tpl_out, "prompt") == ("PromptHelperInject", "prompt")
+      and _tpl_src(_tpl_out, "negative_prompt") == ("PromptHelperInject", "negative_prompt"))
+for _nid in (n["id"] for n in wf["nodes"] if n["type"] == "CLIPTextEncode"):
+    check("CLIP 编码 clip ← LoraStack.clip（LoRA 后）、text ← Inject",
+          _tpl_src(_nid, "clip") == ("PromptHelperLoraStack", "clip")
+          and _tpl_src(_nid, "text")[0] == "PromptHelperInject")
+check("正负条件来自 Inject 不同输出口",
+      _tpl_src(next(n["id"] for n in wf["nodes"] if n["type"] == "CLIPTextEncode" and n.get("title") == "正向条件编码"), "text")[1] == "prompt"
+      and _tpl_src(next(n["id"] for n in wf["nodes"] if n["type"] == "CLIPTextEncode" and n.get("title") == "负向条件编码"), "text")[1] == "negative_prompt")
+_tpl_params = next(n for n in wf["nodes"] if n["type"] == "PromptHelperParams")
+check("Params.width/height/batch 三口悬空（改图链不消费）",
+      all(_tpl_params["outputs"][i]["links"] is None for i in (5, 6, 7)))
+check("全 22 条 link 端点/类型/双向引用一致",
+      all(tpl_nodes.get(l[1]) and tpl_nodes.get(l[3])
+          and tpl_nodes[l[1]]["outputs"][l[2]]["type"] == l[5]
+          and tpl_nodes[l[3]]["inputs"][l[4]]["type"] == l[5]
+          and tpl_nodes[l[3]]["inputs"][l[4]].get("link") == l[0]
+          and l[0] in (tpl_nodes[l[1]]["outputs"][l[2]].get("links") or [])
+          for l in wf["links"]))
+check("last_node_id / last_link_id 与实际一致",
+      wf["last_node_id"] == max(tpl_nodes) and wf["last_link_id"] == max(tpl_links))
+check("order 为合法拓扑序（所有 link 源先于目标）",
+      all(tpl_nodes[l[1]]["order"] < tpl_nodes[l[3]]["order"] for l in wf["links"]))
+_tpl_w = {n["type"]: n.get("widgets_values") for n in wf["nodes"]}
+check("契约路径 widget 全为裸文件名（任意安装路径导入即用）",
+      _tpl_w["PromptHelperCheckpoint"] == ["checkpoint.json"]
+      and _tpl_w["PromptHelperLoraStack"] == ["lora_list.json"]
+      and _tpl_w["PromptHelperParams"] == ["params.json"]
+      and _tpl_w["PromptHelperImageInput"] == ["image.json"]
+      and _tpl_w["PromptHelperFilter"] == ["filter_output.txt"])
+check("Inject widget（prompt.txt / prompt_neg.txt 裸名 + 空 base + 位置 + 合并）",
+      _tpl_w["PromptHelperInject"] == ["prompt.txt", "prompt_neg.txt", "", "", "追加到末尾", True])
 
 print("\n全部测试通过 ✔")
