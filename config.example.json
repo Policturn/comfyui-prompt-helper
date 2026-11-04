@@ -1,6 +1,7 @@
 {
-  "path": "E:\\path\\to\\your\\prompt.txt",
-  "negative_path": "E:\\path\\to\\your\\negative-prompt.txt",
+  "_note": "v2.0.0 起本 config 只承载编辑器联动（autostart/editor_path）；path/negative_path 为 v1.x Inject 节点遗留键，现无消费方（保留无害）。",
+  "path": "",
+  "negative_path": "",
   "autostart": false,
   "editor_path": "E:\\path\\to\\your\\tag-editor.exe"
 }

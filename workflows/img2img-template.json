@@ -1,4 +1,5 @@
 {
+  "_deprecated_note": "DEPRECATED (comfyui-prompt-helper v2.0.0 / FeeTagHelper v2.24.0 架构 v2)：执行链已改为图构建器（快照→API 图直提交），不再读取本模板；保留仅供网页画布手动搭建参考（PromptHelper* 六节点已随 v2.0.0 删除，画布打开会缺节点——请改用原生节点 + PathLoraLoader/PathCheckpointLoader）。",
   "last_node_id": 11,
   "last_link_id": 22,
   "nodes": [
