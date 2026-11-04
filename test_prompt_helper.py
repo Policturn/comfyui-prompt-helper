@@ -566,14 +566,28 @@ check("LoraList：脏条目过滤 + 权重缺省/坏值回落 1.0",
       entries == [{"name": "a.safetensors", "model": 0.8, "clip": 0.7},
                   {"name": "b.safetensors", "model": 1.0, "clip": 1.0},
                   {"name": "c.safetensors", "model": 1.0, "clip": 1.0}] and err == "")
+_write(os.path.join(CT_DIR, "lora_path.json"),
+       json.dumps([{"name": "p.safetensors", "path": r"D:\m\p.safetensors", "model": 0.9},
+                   {"name": "q.safetensors", "path": "  ", "clip": 0.5},
+                   {"name": "r.safetensors", "path": 123}]))
+entries, _ = mod._read_lora_list(os.path.join(CT_DIR, "lora_path.json"))
+check("LoraList：v1.8.1 path 键透传（非空字符串）+ 空/非串 path 省略键",
+      entries == [{"name": "p.safetensors", "path": r"D:\m\p.safetensors", "model": 0.9, "clip": 1.0},
+                  {"name": "q.safetensors", "model": 1.0, "clip": 0.5},
+                  {"name": "r.safetensors", "model": 1.0, "clip": 1.0}])
 entries_missing, err_missing = mod._read_lora_list(missing_json)
 check("LoraList：缺失 → 空列表（直通安全默认）", entries_missing == [] and "不存在" in err_missing)
 
 ckpt_ok = os.path.join(CT_DIR, "checkpoint.json")
 _write(ckpt_ok, json.dumps({"name": "testmodel.safetensors"}))
-check("Checkpoint：正常读取", mod._read_checkpoint_name(ckpt_ok) == ("testmodel.safetensors", ""))
+check("Checkpoint：正常读取", mod._read_checkpoint_entry(ckpt_ok) == ("testmodel.safetensors", "", ""))
+_write(ckpt_ok, json.dumps({"name": "", "path": r"D:\m\base.safetensors"}))
+check("Checkpoint：仅 path（v1.8.1）→ name 空 + path 透传",
+      mod._read_checkpoint_entry(ckpt_ok) == ("", r"D:\m\base.safetensors", ""))
+_write(ckpt_ok, json.dumps({"name": "", "path": "  "}))
+check("Checkpoint：name 与 path 双空 → 报错口径", mod._read_checkpoint_entry(ckpt_ok)[0] is None)
 _write(ckpt_ok, json.dumps({"name": ""}))
-check("Checkpoint：name 空 → 报错口径", mod._read_checkpoint_name(ckpt_ok)[0] is None)
+check("Checkpoint：name 空 → 报错口径", mod._read_checkpoint_entry(ckpt_ok)[0] is None)
 
 filter_missing = filter_cls()
 check("Filter：缺失 → 未配置（安全默认）",
@@ -636,7 +650,12 @@ class _FakeFP:
 
     @staticmethod
     def get_folder_paths(kind):
-        return [CT_DIR] if kind == "embeddings" else []
+        # v1.8.1：loras 也返回注册根（basename 递归搜索兜底层的测面——CT_DIR 即 loras 根）
+        if kind == "embeddings":
+            return [CT_DIR]
+        if kind == "loras":
+            return [CT_DIR]
+        return []
 
     @staticmethod
     def get_output_directory():
@@ -684,10 +703,62 @@ try:
     model, clip, count = lora_cls().apply_loras(1, 2, lora_ok)
     check("LoraStack：未注册 LoRA 跳过不拦链", model == 2 and clip == 3 and count == 1)
 
+    # v1.8.1 三层解析：path 绝对路径直读（跨目录——文件在 loras 注册根之外，注册名/搜索两层
+    # 都不可能命中，唯一通路=path 层）
+    import shutil as _shutil
+    _ext_dir = tempfile.mkdtemp(prefix="fth_lora_ext_")
+    _direct = os.path.join(_ext_dir, "directlora.safetensors")
+    with open(_direct, "wb") as f:
+        f.write(b"direct-lora-bytes")
+    _write(lora_ok, json.dumps([{"name": "directlora.safetensors", "path": _direct, "model": 0.7, "clip": 0.7}]))
+    model, clip, count = lora_cls().apply_loras(1, 2, lora_ok)
+    check("LoraStack：条目 path 绝对路径直读（跨注册根外目录）",
+          model == 2 and clip == 3 and count == 1
+          and _lora_apply_calls[-1] == ("torch:directlora.safetensors", 0.7, 0.7))
+    _hash_direct = hashlib.sha256(b"direct-lora-bytes").hexdigest()[:10]
+    _text_direct = mod._build_a1111_parameters("p", "", {}, None, mod._read_lora_list(lora_ok)[0])
+    check("A1111：Lora hashes 随条目 path 直读层取哈希",
+          _text_direct == f'p\nLora hashes: "directlora: {_hash_direct}"')
+    # path 指向不存在文件 + name 注册在册 → 回落 name 注册名解析
+    _write(lora_ok, json.dumps([{"name": "a.safetensors", "path": os.path.join(_ext_dir, "gone.safetensors")}]))
+    model, clip, count = lora_cls().apply_loras(1, 2, lora_ok)
+    check("LoraStack：path 不在 → 回落 name 注册名解析",
+          model == 2 and clip == 3 and count == 1
+          and _lora_apply_calls[-1][0] == "torch:a.safetensors")
+    # path 不在 + name 未注册 → basename 递归搜索兜底（文件在 loras 根子目录、注册表无此名）
+    _walk_sub = os.path.join(CT_DIR, "walksub")
+    os.makedirs(_walk_sub, exist_ok=True)
+    with open(os.path.join(_walk_sub, "walkonly.safetensors"), "wb") as f:
+        f.write(b"walk-lora-bytes")
+    mod._loras_basename_cache = None   # 重建兜底索引（早前 miss 时建的索引不含本文件）
+    _write(lora_ok, json.dumps([{"name": "walkonly.safetensors"}]))
+    model, clip, count = lora_cls().apply_loras(1, 2, lora_ok)
+    check("LoraStack：注册名 miss → 注册目录 basename 递归搜索兜底命中",
+          model == 2 and clip == 3 and count == 1
+          and _lora_apply_calls[-1][0] == "torch:walkonly.safetensors")
+    _shutil.rmtree(_ext_dir, ignore_errors=True)
+
     model, clip, vae, name = ckpt_cls().load(ckpt_ok)
     check("Checkpoint：加载输出 model/clip/vae/name（name 去扩展名）",
           (model, clip, vae, name) == ("MODEL", "CLIP", "VAE", "testmodel")
           and _ckpt_load_calls[-1].endswith("testmodel.safetensors"))
+    # v1.8.1：checkpoint path 直读（跨注册根外目录——注册名不可能命中的唯一通路）
+    _ckpt_ext = tempfile.mkdtemp(prefix="fth_ckpt_ext_")
+    _ckpt_direct = os.path.join(_ckpt_ext, "directmodel.safetensors")
+    open(_ckpt_direct, "wb").close()
+    _write(ckpt_ok, json.dumps({"name": "directmodel.safetensors", "path": _ckpt_direct}))
+    model, clip, vae, name = ckpt_cls().load(ckpt_ok)
+    check("Checkpoint：条目 path 绝对路径直读",
+          (model, clip, vae, name) == ("MODEL", "CLIP", "VAE", "directmodel")
+          and _ckpt_load_calls[-1] == _ckpt_direct)
+    _write(ckpt_ok, json.dumps({"name": "", "path": os.path.join(_ckpt_ext, "gone.safetensors")}))
+    try:
+        ckpt_cls().load(ckpt_ok)
+        raise SystemExit("应当 RuntimeError")
+    except RuntimeError as e:
+        check("Checkpoint：仅 path 且文件不在 → 清晰报错（不静默换模型）", "不存在" in str(e))
+    _shutil.rmtree(_ckpt_ext, ignore_errors=True)
+    _write(ckpt_ok, json.dumps({"name": "testmodel.safetensors"}))   # 复位供后续段用
     _write(ckpt_ok, json.dumps({"name": "notfound.safetensors"}))
     try:
         ckpt_cls().load(ckpt_ok)

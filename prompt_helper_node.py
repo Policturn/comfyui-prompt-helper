@@ -117,6 +117,17 @@ return_type_mismatch 拦链，received==input 全等或 list 才放行；列表�
 （widget 值不经本节点连线）零影响。②ImageInput latent 输出口补 {"samples": t}
 包装：本版 VAE.encode() 返回裸张量（核心 VAEEncode 节点才做 LATENT 包装），
 不包装则 KSampler 取 latent["samples"] IndexError 拦链。
+
+v1.8.1（2026-11-04，LoRA 子目录名解析修复批，本仓专属）：lora_list.json /
+checkpoint.json 条目增可选 path 键（绝对路径，编辑器 fth v2.22.1 起由其模型库
+解析写入）。读侧三层解析（_resolve_lora_path）：① 条目 path 在且文件存在 →
+直接绝对路径加载（零桥依赖——不经 folder_paths 注册名解析、不依赖
+extra_model_paths.yaml）；② path 缺失/文件不在 → name 注册名解析（子目录前缀
+相对名）；③ 注册目录 basename 递归搜索兜底（历史手写契约/其他写方防护，
+os.walk 索引进程内缓存）。Checkpoint 节点同型（path 优先、name 兜底）。
+背景实锤：2026-11-04 用户报「lora 都没有生效」——object_info LoraLoader
+2900 项中 2899 项带子目录前缀（'A 常用\\xxx.safetensors' 形态），旧契约裸名
+写法经 get_full_path 不命中 → LoraStack 静默跳过。旧契约（无 path 键）零迁移。
 """
 
 import base64
@@ -198,7 +209,18 @@ IMAGE_SCALE_SIDE_STEP = 16   # 放大后边长取整步长（16 倍数）
 #   去 ImageInput 段、KSampler.latent_image 改接 EmptyLatentImage（width/height/batch_size
 #   接 Params 三口）。编辑器生成轮（FeeTagHelper v2.22.0 起）直读本模板提交，不再依赖
 #   workflow_snapshot.json 手搭上报。节点与契约面零改动。
-PLUGIN_VERSION = "1.8.0"
+# v1.8.1（2026-11-04，LoRA 子目录名解析修复批）：lora_list.json / checkpoint.json 条目
+#   增可选 path 键（绝对路径）——编辑器（fth v2.22.1 起）由其模型库解析模型位置写入
+#   （fth 是模型位置的唯一事实源）。读侧三层解析（_resolve_lora_path）：① 条目 path 在
+#   且文件存在 → 直接以绝对路径加载（comfy.lora 加载器本吃完整路径；不经 folder_paths
+#   注册名解析、不依赖 extra_model_paths.yaml 桥——编辑器侧从此零桥依赖）；② path 缺失/
+#   文件不在 → 回落 name 注册名解析（子目录前缀相对名，get_full_path 逐注册根 os.path
+#   join + isfile 命中——2026-11-04 实测 object_info LoraLoader 2900 项中 2899 项带
+#   子目录前缀，裸名仅 1 项，旧裸名写法=静默跳过即「lora 都没有生效」的根因）；
+#   ③ 注册目录 basename 递归搜索兜底（防历史手写契约文件/其他写方——进程内缓存一次
+#   os.walk 索引，只在 miss 时触发）。Checkpoint 节点同型：path 优先直读，name 兜底
+#   注册名解析。Lora hashes infotext 段随解析层取文件哈希。旧契约（无 path 键）零迁移。
+PLUGIN_VERSION = "1.8.1"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
@@ -510,9 +532,11 @@ def _read_params(params_file):
 def _read_lora_list(lora_file):
     """读 lora_list.json → 规范化条目列表。返回 (entries, 错误消息)。
 
-    [{name, model, clip}, ...]：name 必填（strip 后非空），权重缺省 1.0、
-    坏值回落 1.0；非对象条目 / 无名条目静默跳过（写方脏数据不拦整链）。
-    缺失 / 损坏 → 空列表（LoraStack 直通安全默认）。"""
+    [{name, path?, model, clip}, ...]（v1.8.1 起条目可带可选 path=绝对路径——
+    编辑器 fth 模型库解析的模型位置，读侧 _resolve_lora_path path 优先直读）：
+    name 必填（strip 后非空），path 非字符串/空串 → 键省略（走 name 兜底）；
+    权重缺省 1.0、坏值回落 1.0；非对象条目 / 无名条目静默跳过（写方脏数据
+    不拦整链）。缺失 / 损坏 → 空列表（LoraStack 直通安全默认）。"""
     data, err = _read_json_file(lora_file, list)
     entries = []
     for item in (data or []):
@@ -521,23 +545,31 @@ def _read_lora_list(lora_file):
         name = str(item.get("name") or "").strip()
         if not name:
             continue
-        entries.append({
+        entry = {
             "name": name,
             "model": _to_float(item.get("model", 1.0), 1.0),
             "clip": _to_float(item.get("clip", 1.0), 1.0),
-        })
+        }
+        path = item.get("path")
+        if isinstance(path, str) and path.strip():
+            entry["path"] = path.strip()
+        entries.append(entry)
     return entries, err
 
 
-def _read_checkpoint_name(checkpoint_file):
-    """读 checkpoint.json（{"name": "xxx.safetensors"}）。返回 (名字或 None, 错误消息)。"""
+def _read_checkpoint_entry(checkpoint_file):
+    """读 checkpoint.json（{"name": "xxx.safetensors", "path": "绝对路径"?}——v1.8.1
+    起可带可选 path，读侧 path 优先直读）。返回 (名字或 None, path 或 "", 错误消息)；
+    name 与 path 双空 → (None, "", 错误)（不可安全默认，调用方清晰报错）。"""
     data, err = _read_json_file(checkpoint_file, dict)
     if data is None:
-        return None, err
+        return None, "", err
     name = str(data.get("name") or "").strip()
-    if not name:
-        return None, "未指定模型名（checkpoint.json 的 name 为空）"
-    return name, ""
+    path = data.get("path")
+    path = path.strip() if isinstance(path, str) else ""
+    if not name and not path:
+        return None, "", "未指定模型（checkpoint.json 的 name 与 path 均为空）"
+    return name, path, ""
 
 
 def _resolve_contract_path(raw):
@@ -725,28 +757,78 @@ def _file_hash_prefix(path):
     return value
 
 
-def _resolve_lora_path(name):
-    """把 LoRA 名字解析为 models/loras 注册表下的完整路径。绝对路径且文件在 →
-    原样接受；无 ComfyUI 环境（离线干跑）/ 未注册 / 不在 → None。"""
-    if os.path.isabs(name) and os.path.isfile(name):
-        return name
+def _resolve_lora_path(name, path=None):
+    """把 LoRA 条目解析为可加载文件（v1.8.1 三层）。返回完整路径或 None。
+
+    ① path（可选入参，条目 path 键）：绝对路径且文件在 → 原样返回（编辑器
+       fth 模型库解析的模型位置——跨目录直读，不经 folder_paths 注册名解析、
+       不依赖 extra_model_paths.yaml 桥）；
+    ② name 注册名解析：name 本身是绝对路径且文件在 → 直读；否则
+       folder_paths.get_full_path("loras", name)（子目录前缀相对名逐注册根
+       os.path.join + isfile 命中——'A 常用\\x.safetensors' 形态）；
+    ③ 注册目录 basename 递归搜索兜底（_search_lora_basename）：防历史手写
+       契约文件 / 其他写方（裸名 + 实际在子目录的场景）。
+    无 ComfyUI 环境（离线干跑）→ ② 不可用（③ 无根目录同样不可用）→ None。"""
+    p = (path or "").strip()
+    if p and os.path.isabs(p) and os.path.isfile(p):
+        return p
+    n = (name or "").strip()
+    if not n:
+        return None
+    if os.path.isabs(n) and os.path.isfile(n):
+        return n
     try:
         from folder_paths import get_full_path
     except ImportError:
         return None
     try:
-        return get_full_path("loras", name) or None
+        hit = get_full_path("loras", n) or None
+    except Exception:
+        hit = None
+    return hit or _search_lora_basename(n)
+
+
+# v1.8.1 兜底层索引缓存：{basename小写: [完整路径, ...]}；None = 未建。只在
+# _search_lora_basename 首次触发时对 loras 注册目录做一次 os.walk（生产 ~2900
+# 文件毫秒级），此后进程内复用——新落盘文件要等 ComfyUI 重启才进兜底索引
+# （主链 path 直读/注册名解析不受影响，兜底层只为miss 场景兜底，可接受）。
+_loras_basename_cache = None
+
+
+def _search_lora_basename(name):
+    """loras 注册目录 basename 递归搜索（v1.8.1 兜底层）：name 的 basename
+    （容 / 与 \\ 前缀）在各注册根下递归找同名文件，首个存在者返回；无注册
+    目录 / 无 ComfyUI 环境 / 未找到 → None。索引进程内缓存一次（见上注）。"""
+    global _loras_basename_cache
+    base = os.path.basename((name or "").strip().replace("\\", "/"))
+    if not base:
+        return None
+    try:
+        from folder_paths import get_folder_paths
+        roots = [r for r in (get_folder_paths("loras") or []) if r and os.path.isdir(str(r))]
     except Exception:
         return None
+    if _loras_basename_cache is None:
+        index = {}
+        for root in roots:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for fn in filenames:
+                    index.setdefault(fn.lower(), []).append(os.path.join(dirpath, fn))
+        _loras_basename_cache = index
+    for hit in _loras_basename_cache.get(base.lower(), []):
+        if os.path.isfile(hit):
+            return hit
+    return None
 
 
 def _lora_hashes_field(lora_entries):
     """LoRA 短哈希 infotext 段：`"name1: hash1, name2: hash2"`（A1111
     Lora hashes 键同款，名字去扩展名）。文件解析不到 / 哈希失败的条目跳过；
-    全空返回 ""（调用方省略该段）。"""
+    全空返回 ""（调用方省略该段）。v1.8.1：解析随条目 path 优先（entry.get
+    ("path")——直读层解析到哪层就哈希哪层）。"""
     parts = []
     for entry in lora_entries:
-        path = _resolve_lora_path(entry["name"])
+        path = _resolve_lora_path(entry["name"], entry.get("path"))
         prefix = _file_hash_prefix(path) if path else ""
         if not prefix:
             continue
@@ -1095,7 +1177,8 @@ class PromptHelperLoraStack:
                 "lora_file": ("STRING", {
                     "default": LORA_LIST_PATH,
                     "multiline": False,
-                    "tooltip": "LoRA 清单 JSON（编辑器工作台写方）：[{\"name\":\"x.safetensors\",\"model\":0.8,\"clip\":0.8},...]；缺失/损坏时直通不叠加",
+                    "tooltip": "LoRA 清单 JSON（编辑器工作台写方）：[{\"name\":\"A 常用\\\\x.safetensors\",\"path\":\"D:\\\\models\\\\A 常用\\\\x.safetensors\",\"model\":0.8,\"clip\":0.8},...]；"
+                               "path（v1.8.1 可选，编辑器模型库解析的绝对路径）在且文件存在=直接跨目录加载，缺失/不在=回落 name 注册名解析（子目录前缀相对名）；缺失/损坏时直通不叠加",
                 }),
             },
         }
@@ -1121,10 +1204,14 @@ class PromptHelperLoraStack:
             import comfy.sd
             import comfy.utils
             for entry in entries:
-                path = _resolve_lora_path(entry["name"])
+                # v1.8.1 三层解析：条目 path 绝对路径直读 > name 注册名解析 > basename 搜索兜底
+                direct = (entry.get("path") or "").strip()
+                path = _resolve_lora_path(entry["name"], direct)
                 if not path:
-                    _log(f"LoRA 未找到，跳过：{entry['name']}")
+                    _log(f"LoRA 未找到，跳过：{entry['name']}"
+                         + (f"（path 不在：{direct}）" if direct else ""))
                     continue
+                via = "绝对路径直读" if direct and path == direct else "注册名解析"
                 try:
                     lora = comfy.utils.load_torch_file(path, safe_load=True)
                     model, clip = comfy.sd.load_lora_for_models(
@@ -1133,7 +1220,7 @@ class PromptHelperLoraStack:
                     _log(f"LoRA 加载失败，跳过 {entry['name']}：{e}")
                     continue
                 applied += 1
-                _log(f"LoRA 已叠加：{entry['name']}（model={entry['model']:g}, clip={entry['clip']:g}）")
+                _log(f"LoRA 已叠加：{entry['name']}（model={entry['model']:g}, clip={entry['clip']:g}，{via}）")
         return (model, clip, applied)
 
 
@@ -1245,7 +1332,7 @@ class PromptHelperImageOutput:
         lora_entries, lora_err = _read_lora_list(LORA_LIST_PATH)
         if lora_err:
             _log(f"lora_list.json 读取：{lora_err}（parameters 省略 Lora hashes 段）")
-        model_name, ckpt_err = _read_checkpoint_name(CHECKPOINT_PATH)
+        model_name, _ckpt_path, ckpt_err = _read_checkpoint_entry(CHECKPOINT_PATH)
         if ckpt_err:
             _log(f"checkpoint.json 读取：{ckpt_err}（parameters 省略 Model 段）")
         meta_pos, meta_neg = _fth_meta_records()
@@ -1294,7 +1381,8 @@ class PromptHelperCheckpoint:
                 "checkpoint_file": ("STRING", {
                     "default": CHECKPOINT_PATH,
                     "multiline": False,
-                    "tooltip": "基模选择 JSON（编辑器模型页写方）：{\"name\":\"xxx.safetensors\"}；缺失/未注册时报错",
+                    "tooltip": "基模选择 JSON（编辑器模型页写方）：{\"name\":\"xxx.safetensors\",\"path\":\"D:\\\\models\\\\xxx.safetensors\"}；"
+                               "path（v1.8.1 可选，编辑器模型库解析的绝对路径）在且文件存在=直接跨目录加载，缺失/不在=回落 name 注册名解析；缺失/未找到时报错",
                 }),
             },
         }
@@ -1311,26 +1399,44 @@ class PromptHelperCheckpoint:
 
     def load(self, checkpoint_file):
         checkpoint_file = _resolve_contract_path(checkpoint_file)  # v1.6.0 裸文件名 → 插件目录
-        name, err = _read_checkpoint_name(checkpoint_file)
-        if name is None:
+        # v1.8.1：条目可带 path（编辑器 fth 模型库解析的绝对路径）——path 在且文件存在 →
+        # 直接跨目录加载（不经 folder_paths 注册名解析）；缺失/不在 → 回落 name 注册名解析
+        name, ckpt_path, err = _read_checkpoint_entry(checkpoint_file)
+        if name is None and not ckpt_path:
             # 不可安全默认：基模缺席静默换模型出图比报错更糟——节点红字清晰报错
             raise RuntimeError(
                 f"prompt-helper 基模加载失败：{err}（请在 FeeTagHelper 模型页选择基模生成 checkpoint.json）")
-        try:
-            from folder_paths import get_full_path, get_folder_paths
-        except ImportError as e:
-            raise RuntimeError(f"prompt-helper：无 ComfyUI 模型环境（{e}）")
-        path = get_full_path("checkpoints", name)
-        if not path:
-            raise RuntimeError(f"prompt-helper：模型未找到：{name}（models/checkpoints 无此文件）")
+        path = ""
+        via = ""
+        if ckpt_path and os.path.isabs(ckpt_path) and os.path.isfile(ckpt_path):
+            path = ckpt_path
+            via = "绝对路径直读"
+        else:
+            if not name:
+                # 只有 path 但文件不在（且无名可兜底）——报错指路 path 实际值
+                raise RuntimeError(
+                    f"prompt-helper：基模路径不存在：{ckpt_path}（checkpoint.json 的 path 指向的文件不在）")
+            try:
+                from folder_paths import get_full_path, get_folder_paths
+            except ImportError as e:
+                raise RuntimeError(f"prompt-helper：无 ComfyUI 模型环境（{e}）")
+            path = get_full_path("checkpoints", name)
+            if not path:
+                raise RuntimeError(f"prompt-helper：模型未找到：{name}（models/checkpoints 无此文件）")
+            via = "注册名解析" + ("（path 不在回落）" if ckpt_path else "")
         import comfy.sd
-        embed_dirs = get_folder_paths("embeddings")
+        try:
+            from folder_paths import get_folder_paths
+            embed_dirs = get_folder_paths("embeddings")
+        except ImportError:
+            embed_dirs = []
         out = comfy.sd.load_checkpoint_guess_config(
             path, output_vae=True, output_clip=True,
             embedding_directory=embed_dirs[0] if embed_dirs else None)
-        _log(f"基模已加载：{name}")
-        # name 输出 = 去 extension 的模型名（与 parameters 的 Model 字段同口径）
-        return (out[0], out[1], out[2], os.path.splitext(os.path.basename(name))[0])
+        _log(f"基模已加载：{name or os.path.basename(path)}（{via}）")
+        # name 输出 = 去 extension 的模型名（与 parameters 的 Model 字段同口径——
+        # path 直读时取实际加载文件的 basename）
+        return (out[0], out[1], out[2], os.path.splitext(os.path.basename(path))[0])
 
 
 class PromptHelperFilter:
