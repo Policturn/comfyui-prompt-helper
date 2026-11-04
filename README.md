@@ -242,6 +242,25 @@ VAEDecode）的完整接线。使用：
 同名文件——官方模板因此在**任意安装路径**导入即用，无需手工改路径；
 绝对路径照旧原样使用，旧工作流零迁移。
 
+## 文生图官方模板 v1.8.0（workflows/txt2img-template.json，2026-11-04）
+
+v1.8.0 新增**文生图**官方工作流模板。生成逻辑与改图模板（v1.6.0）完全
+同构，只差输入段：
+
+- **去掉** `PromptHelperImageInput`（及其 VAE 接线）——文生图没有源图；
+- `KSampler.latent_image` 改接原生 **EmptyLatentImage**；
+- EmptyLatentImage 的 `width` / `height` / `batch_size` 三口分别接
+  **Params 节点的 `width` / `height` / `batch` 三输出口**（改图模板里这三口
+  悬空不消费，文生图正好启用——尺寸与总张数仍由编辑器 `params.json` 契约
+  驱动，`batch` 语义 = 批次 × 单批合并）；
+- `KSampler.denoise` 悬空由 widget 承载（= 1，文生图全重绘）。
+
+节点与契约面**零改动**（七件套不变、无新契约文件）。FeeTagHelper
+v2.22.0 起生成面板的 ComfyUI 轮直读本模板（UI 格式确定性转 API 格式后
+提交）——**不再依赖「先在 ComfyUI 手搭六节点点一次生成上报
+workflow_snapshot.json」的启动序**；快照上报机制本身保留（Inject 节点
+行为不变，手搭工作流照常可用）。
+
 ## 姊妹项目
 
 同一核心逻辑的 SD WebUI 扩展版：
