@@ -1072,6 +1072,78 @@ check("契约路径 widget 全为裸文件名（任意安装路径导入即用�
 check("Inject widget（prompt.txt / prompt_neg.txt 裸名 + 空 base + 位置 + 合并）",
       _tpl_w["PromptHelperInject"] == ["prompt.txt", "prompt_neg.txt", "", "", "追加到末尾", True])
 
+print("== v1.8.0 官方文生图模板 workflows/txt2img-template.json ==")
+T2I = os.path.join(HERE, "workflows", "txt2img-template.json")
+wf2 = json.load(open(T2I, encoding="utf-8"))
+t2i_nodes = {n["id"]: n for n in wf2["nodes"]}
+t2i_links = {l[0]: l for l in wf2["links"]}
+check("模板存在且 JSON 可解析 + 版本 0.4", wf2.get("version") == 0.4)
+_t2i_types = [n["type"] for n in wf2["nodes"]]
+check("节点齐备（7 插件节点 + KSampler/CLIPTextEncode×2/VAEDecode/EmptyLatentImage）",
+      {"PromptHelperInject", "PromptHelperParams", "PromptHelperLoraStack", "PromptHelperCheckpoint",
+       "PromptHelperImageOutput", "PromptHelperFilter",
+       "KSampler", "CLIPTextEncode", "VAEDecode", "EmptyLatentImage"} <= set(_t2i_types))
+check("无 ImageInput / VAEEncode（文生图 latent 来自 EmptyLatentImage）",
+      "PromptHelperImageInput" not in _t2i_types and "VAEEncode" not in _t2i_types)
+
+
+def _t2i_src(nid, inp):
+    _n = t2i_nodes[nid]
+    _lid = next(i["link"] for i in _n["inputs"] if i["name"] == inp)
+    _l = t2i_links[_lid]
+    return t2i_nodes[_l[1]]["type"], t2i_nodes[_l[1]]["outputs"][_l[2]]["name"]
+
+
+_t2i_ks = next(n["id"] for n in wf2["nodes"] if n["type"] == "KSampler")
+check("KSampler.latent_image ← EmptyLatentImage.latent",
+      _t2i_src(_t2i_ks, "latent_image") == ("EmptyLatentImage", "LATENT"))
+check("KSampler.denoise 悬空（widget 承载=1，文生图全重绘）",
+      next(i["link"] for i in t2i_nodes[_t2i_ks]["inputs"] if i["name"] == "denoise") is None
+      and t2i_nodes[_t2i_ks]["widgets_values"][6] == 1)
+check("KSampler 五采样参数 ← Params 五口（seed/steps/cfg/sampler/scheduler）",
+      all(_t2i_src(_t2i_ks, k) == ("PromptHelperParams", v) for k, v in
+          (("seed", "seed"), ("steps", "steps"), ("cfg", "cfg"),
+           ("sampler_name", "sampler"), ("scheduler", "scheduler"))))
+check("KSampler.model ← LoraStack.model；正负条件 ← 两个 CLIP 编码",
+      _t2i_src(_t2i_ks, "model") == ("PromptHelperLoraStack", "model")
+      and _t2i_src(_t2i_ks, "positive")[0] == "CLIPTextEncode"
+      and _t2i_src(_t2i_ks, "negative")[0] == "CLIPTextEncode")
+_t2i_eli = next(n["id"] for n in wf2["nodes"] if n["type"] == "EmptyLatentImage")
+check("EmptyLatentImage 三口全接 Params（width/height/batch_size ← Params 三悬空口启用）",
+      _t2i_src(_t2i_eli, "width") == ("PromptHelperParams", "width")
+      and _t2i_src(_t2i_eli, "height") == ("PromptHelperParams", "height")
+      and _t2i_src(_t2i_eli, "batch_size") == ("PromptHelperParams", "batch"))
+check("Params.width/height/batch 三口全接出（对照改图模板悬空——文生图消费）",
+      all(t2i_nodes[next(n["id"] for n in wf2["nodes"] if n["type"] == "PromptHelperParams")]["outputs"][i]["links"]
+          for i in (5, 6, 7)))
+_t2i_out = next(n["id"] for n in wf2["nodes"] if n["type"] == "PromptHelperImageOutput")
+check("ImageOutput：image ← VAEDecode、正负提示词 ← Inject 两口",
+      _t2i_src(_t2i_out, "image") == ("VAEDecode", "IMAGE")
+      and _t2i_src(_t2i_out, "prompt") == ("PromptHelperInject", "prompt")
+      and _t2i_src(_t2i_out, "negative_prompt") == ("PromptHelperInject", "negative_prompt"))
+check("Checkpoint.vae 只喂 VAEDecode（无 ImageInput 段）",
+      t2i_nodes[next(n["id"] for n in wf2["nodes"] if n["type"] == "PromptHelperCheckpoint")]["outputs"][2]["links"] == [19])
+check("全 23 条 link 端点/类型/双向引用一致（22 少 ImageInput 三条、多 EmptyLatentImage 四条）",
+      all(t2i_nodes.get(l[1]) and t2i_nodes.get(l[3])
+          and t2i_nodes[l[1]]["outputs"][l[2]]["type"] == l[5]
+          and t2i_nodes[l[3]]["inputs"][l[4]]["type"] == l[5]
+          and t2i_nodes[l[3]]["inputs"][l[4]].get("link") == l[0]
+          and l[0] in (t2i_nodes[l[1]]["outputs"][l[2]].get("links") or [])
+          for l in wf2["links"]) and len(wf2["links"]) == 23)
+check("last_node_id / last_link_id 与实际一致",
+      wf2["last_node_id"] == max(t2i_nodes) and wf2["last_link_id"] == max(t2i_links))
+check("order 为合法拓扑序（所有 link 源先于目标）",
+      all(t2i_nodes[l[1]]["order"] < t2i_nodes[l[3]]["order"] for l in wf2["links"]))
+_t2i_w = {n["type"]: n.get("widgets_values") for n in wf2["nodes"]}
+check("契约路径 widget 全为裸文件名（与改图模板同规）",
+      _t2i_w["PromptHelperCheckpoint"] == ["checkpoint.json"]
+      and _t2i_w["PromptHelperLoraStack"] == ["lora_list.json"]
+      and _t2i_w["PromptHelperParams"] == ["params.json"]
+      and _t2i_w["PromptHelperFilter"] == ["filter_output.txt"]
+      and "PromptHelperImageInput" not in _t2i_w)
+check("Inject widget 与改图模板逐字一致（prompt 对裸名）",
+      _t2i_w["PromptHelperInject"] == _tpl_w["PromptHelperInject"])
+
 try:
     print("\n全部测试通过 ✔")
 except UnicodeEncodeError:

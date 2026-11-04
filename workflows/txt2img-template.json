@@ -1,0 +1,850 @@
+{
+  "last_node_id": 12,
+  "last_link_id": 26,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "PromptHelperCheckpoint",
+      "pos": [
+        -560,
+        -180
+      ],
+      "size": [
+        340,
+        130
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            2
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "links": [
+            19
+          ],
+          "slot_index": 2
+        },
+        {
+          "name": "name",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PromptHelperCheckpoint"
+      },
+      "widgets_values": [
+        "checkpoint.json"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PromptHelperLoraStack",
+      "pos": [
+        -560,
+        120
+      ],
+      "size": [
+        360,
+        130
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            8
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "links": [
+            3,
+            5
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "count",
+          "type": "INT",
+          "links": null,
+          "slot_index": 2
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PromptHelperLoraStack"
+      },
+      "widgets_values": [
+        "lora_list.json"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PromptHelperInject",
+      "pos": [
+        -1120,
+        -220
+      ],
+      "size": [
+        430,
+        300
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "links": [
+            4,
+            21
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "negative_prompt",
+          "type": "STRING",
+          "links": [
+            6,
+            22
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "tags",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "status",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PromptHelperInject"
+      },
+      "widgets_values": [
+        "prompt.txt",
+        "prompt_neg.txt",
+        "",
+        "",
+        "追加到末尾",
+        true
+      ]
+    },
+    {
+      "id": 4,
+      "type": "CLIPTextEncode",
+      "pos": [
+        40,
+        -260
+      ],
+      "size": [
+        400,
+        170
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 4,
+          "widget": {
+            "name": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            9
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "title": "正向条件编码",
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 5,
+      "type": "CLIPTextEncode",
+      "pos": [
+        40,
+        60
+      ],
+      "size": [
+        400,
+        170
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 5
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 6,
+          "widget": {
+            "name": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            10
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "title": "负向条件编码",
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 6,
+      "type": "PromptHelperParams",
+      "pos": [
+        -1120,
+        200
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "seed",
+          "type": "INT",
+          "links": [
+            12
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "steps",
+          "type": "INT",
+          "links": [
+            13
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "cfg",
+          "type": "FLOAT",
+          "links": [
+            14
+          ],
+          "slot_index": 2
+        },
+        {
+          "name": "sampler",
+          "type": "COMBO",
+          "links": [
+            15
+          ],
+          "slot_index": 3
+        },
+        {
+          "name": "scheduler",
+          "type": "COMBO",
+          "links": [
+            16
+          ],
+          "slot_index": 4
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": [
+            24
+          ],
+          "slot_index": 5
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": [
+            25
+          ],
+          "slot_index": 6
+        },
+        {
+          "name": "batch",
+          "type": "INT",
+          "links": [
+            26
+          ],
+          "slot_index": 7
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PromptHelperParams"
+      },
+      "widgets_values": [
+        "params.json"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "EmptyLatentImage",
+      "pos": [
+        -40,
+        380
+      ],
+      "size": [
+        315,
+        106
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "width",
+          "type": "INT",
+          "link": 24,
+          "widget": {
+            "name": "width"
+          }
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "link": 25,
+          "widget": {
+            "name": "height"
+          }
+        },
+        {
+          "name": "batch_size",
+          "type": "INT",
+          "link": 26,
+          "widget": {
+            "name": "batch_size"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            23
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyLatentImage"
+      },
+      "widgets_values": [
+        832,
+        1216,
+        1
+      ]
+    },
+    {
+      "id": 8,
+      "type": "KSampler",
+      "pos": [
+        540,
+        -60
+      ],
+      "size": [
+        315,
+        474
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 8
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 9
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 10
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 23
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "link": 12,
+          "widget": {
+            "name": "seed"
+          }
+        },
+        {
+          "name": "steps",
+          "type": "INT",
+          "link": 13,
+          "widget": {
+            "name": "steps"
+          }
+        },
+        {
+          "name": "cfg",
+          "type": "FLOAT",
+          "link": 14,
+          "widget": {
+            "name": "cfg"
+          }
+        },
+        {
+          "name": "sampler_name",
+          "type": "COMBO",
+          "link": 15,
+          "widget": {
+            "name": "sampler_name"
+          }
+        },
+        {
+          "name": "scheduler",
+          "type": "COMBO",
+          "link": 16,
+          "widget": {
+            "name": "scheduler"
+          }
+        },
+        {
+          "name": "denoise",
+          "type": "FLOAT",
+          "link": null,
+          "widget": {
+            "name": "denoise"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            18
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        0,
+        "randomize",
+        20,
+        7,
+        "euler",
+        "normal",
+        1
+      ]
+    },
+    {
+      "id": 9,
+      "type": "VAEDecode",
+      "pos": [
+        940,
+        -60
+      ],
+      "size": [
+        210,
+        100
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 18
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            20
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      }
+    },
+    {
+      "id": 10,
+      "type": "PromptHelperImageOutput",
+      "pos": [
+        1220,
+        -220
+      ],
+      "size": [
+        430,
+        260
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 20
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "link": 21,
+          "widget": {
+            "name": "prompt"
+          }
+        },
+        {
+          "name": "negative_prompt",
+          "type": "STRING",
+          "link": 22,
+          "widget": {
+            "name": "negative_prompt"
+          }
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PromptHelperImageOutput"
+      },
+      "widgets_values": [
+        "feetag",
+        "",
+        ""
+      ]
+    },
+    {
+      "id": 11,
+      "type": "PromptHelperFilter",
+      "pos": [
+        -1120,
+        460
+      ],
+      "size": [
+        340,
+        150
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "kept_tags",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 0
+        },
+        {
+          "name": "removed_count",
+          "type": "INT",
+          "links": null,
+          "slot_index": 1
+        },
+        {
+          "name": "total",
+          "type": "INT",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "status",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PromptHelperFilter"
+      },
+      "widgets_values": [
+        "filter_output.txt"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      1,
+      1,
+      2,
+      1,
+      "CLIP"
+    ],
+    [
+      3,
+      2,
+      1,
+      4,
+      0,
+      "CLIP"
+    ],
+    [
+      4,
+      3,
+      0,
+      4,
+      1,
+      "STRING"
+    ],
+    [
+      5,
+      2,
+      1,
+      5,
+      0,
+      "CLIP"
+    ],
+    [
+      6,
+      3,
+      1,
+      5,
+      1,
+      "STRING"
+    ],
+    [
+      8,
+      2,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      9,
+      4,
+      0,
+      8,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      10,
+      5,
+      0,
+      8,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      12,
+      6,
+      0,
+      8,
+      4,
+      "INT"
+    ],
+    [
+      13,
+      6,
+      1,
+      8,
+      5,
+      "INT"
+    ],
+    [
+      14,
+      6,
+      2,
+      8,
+      6,
+      "FLOAT"
+    ],
+    [
+      15,
+      6,
+      3,
+      8,
+      7,
+      "COMBO"
+    ],
+    [
+      16,
+      6,
+      4,
+      8,
+      8,
+      "COMBO"
+    ],
+    [
+      18,
+      8,
+      0,
+      9,
+      0,
+      "LATENT"
+    ],
+    [
+      19,
+      1,
+      2,
+      9,
+      1,
+      "VAE"
+    ],
+    [
+      20,
+      9,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      21,
+      3,
+      0,
+      10,
+      1,
+      "STRING"
+    ],
+    [
+      22,
+      3,
+      1,
+      10,
+      2,
+      "STRING"
+    ],
+    [
+      23,
+      12,
+      0,
+      8,
+      3,
+      "LATENT"
+    ],
+    [
+      24,
+      6,
+      5,
+      12,
+      0,
+      "INT"
+    ],
+    [
+      25,
+      6,
+      6,
+      12,
+      1,
+      "INT"
+    ],
+    [
+      26,
+      6,
+      7,
+      12,
+      2,
+      "INT"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

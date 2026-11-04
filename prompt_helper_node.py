@@ -194,7 +194,11 @@ IMAGE_SCALE_SIDE_STEP = 16   # 放大后边长取整步长（16 倍数）
 # v1.6.0（2026-11-03）：改图链（img2img）image.json 契约 + ImageInput 节点（本仓专属）。
 # v1.7.0（2026-11-04）：image.json 增 scale（尺寸倍率）字段——ImageInput 按倍率 LANCZOS
 #   放大输入图（边长 16 倍数、64~4096 钳制）后 VAEEncode；超分=尺寸放大的图生图。
-PLUGIN_VERSION = "1.7.0"
+# v1.8.0（2026-11-04）：官方文生图工作流模板 workflows/txt2img-template.json——改图模板
+#   去 ImageInput 段、KSampler.latent_image 改接 EmptyLatentImage（width/height/batch_size
+#   接 Params 三口）。编辑器生成轮（FeeTagHelper v2.22.0 起）直读本模板提交，不再依赖
+#   workflow_snapshot.json 手搭上报。节点与契约面零改动。
+PLUGIN_VERSION = "1.8.0"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 
