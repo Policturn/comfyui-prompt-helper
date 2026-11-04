@@ -860,7 +860,7 @@ check("契约常量指向插件目录",
       mod.IMAGE_JSON_PATH == os.path.join(mod.NODE_DIR, "image.json")
       and mod.IMAGES_DIR == os.path.join(mod.NODE_DIR, "images"))
 check("denoise 契约范围/默认常量",
-      mod.IMAGE_DENOISE_MIN == 0.05 and mod.IMAGE_DENOISE_MAX == 0.95
+      mod.IMAGE_DENOISE_MIN == 0.05 and mod.IMAGE_DENOISE_MAX == 1.0
       and mod.IMAGE_DENOISE_DEFAULT == 0.5)
 _rp = mod._resolve_contract_path
 check("裸文件名 → 插件目录同名文件",
@@ -871,40 +871,42 @@ check("绝对路径 / 含目录路径 / 空串原样返回（零语义变化）"
       and _rp("sub/dir.json") == "sub/dir.json"
       and _rp(r"C:\x\y.json") == r"C:\x\y.json")
 
-print("== v1.6.0 image.json 契约解析 + 边界 ==")
+print("== v1.6.0 image.json 契约解析 + 边界（v1.9.0 起返回 dict：name/denoise/scale/w/h/fit/err） ==")
 img_json = os.path.join(CT_DIR, "image.json")
+_contract_ok = {"name": "a.png", "denoise": 0.5, "scale": 1.0, "w": 0, "h": 0, "fit": "crop", "err": ""}
 _write(img_json, json.dumps({"image": "a.png", "denoise": 0.5}))
-check("正常解析（文件名 + denoise + scale 缺省 1.0）", mod._read_image_contract(img_json) == ("a.png", 0.5, 1.0, ""))
+check("正常解析（文件名 + denoise + scale 缺省 1.0 + w/h 缺省 0=回落 scale）",
+      mod._read_image_contract(img_json) == _contract_ok)
 _write(img_json, json.dumps({"image": "b.png", "extra": 1}))
 check("denoise 缺失 → 默认 0.5；未知字段容忍",
-      mod._read_image_contract(img_json) == ("b.png", 0.5, 1.0, ""))
+      mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png"))
 _write(img_json, json.dumps({"image": "b.png", "denoise": "0.3"}))
-check("denoise 字符串宽松强转", mod._read_image_contract(img_json) == ("b.png", 0.3, 1.0, ""))
+check("denoise 字符串宽松强转", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png", denoise=0.3))
 _write(img_json, json.dumps({"image": "b.png", "denoise": "bad"}))
-check("denoise 坏值 → 默认 0.5", mod._read_image_contract(img_json) == ("b.png", 0.5, 1.0, ""))
+check("denoise 坏值 → 默认 0.5", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png"))
 _write(img_json, '{"image": "b.png", "denoise": NaN}')
-check("denoise NaN 防御 → 默认 0.5", mod._read_image_contract(img_json) == ("b.png", 0.5, 1.0, ""))
+check("denoise NaN 防御 → 默认 0.5", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png"))
 _write(img_json, json.dumps({"image": "b.png", "denoise": 0.06}))
-check("denoise 界内原样", mod._read_image_contract(img_json) == ("b.png", 0.06, 1.0, ""))
+check("denoise 界内原样", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png", denoise=0.06))
 _write(img_json, json.dumps({"image": "b.png", "denoise": 0.0}))
-check("denoise 越界下限收敛 0.05", mod._read_image_contract(img_json) == ("b.png", 0.05, 1.0, ""))
+check("denoise 越界下限收敛 0.05", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png", denoise=0.05))
 _write(img_json, json.dumps({"image": "b.png", "denoise": 1.2}))
-check("denoise 越界上限收敛 0.95", mod._read_image_contract(img_json) == ("b.png", 0.95, 1.0, ""))
+check("denoise 越界上限收敛 1.0（v1.9.0 域扩）", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png", denoise=1.0))
 _write(img_json, json.dumps({"denoise": 0.5}))
-name, den, sc, err = mod._read_image_contract(img_json)
-check("缺 image 字段 → 报错口径", name is None and den is None and "image" in err)
+_c = mod._read_image_contract(img_json)
+check("缺 image 字段 → 报错口径", _c["name"] is None and _c["denoise"] is None and "image" in _c["err"])
 _write(img_json, json.dumps({"image": "   "}))
-check("image 空串 → 报错口径", mod._read_image_contract(img_json)[0] is None)
+check("image 空串 → 报错口径", mod._read_image_contract(img_json)["name"] is None)
 _write(img_json, json.dumps({"image": "../evil.png"}))
-check("image 目录穿越收敛 basename", mod._read_image_contract(img_json)[0] == "evil.png")
+check("image 目录穿越收敛 basename", mod._read_image_contract(img_json)["name"] == "evil.png")
 _write(img_json, json.dumps({"image": r"C:\abs\x.png"}))
-check("image 绝对路径收敛 basename", mod._read_image_contract(img_json)[0] == "x.png")
-name, den, sc, err = mod._read_image_contract(missing_json)
-check("image.json 缺失 → 报错口径", name is None and "不存在" in err)
+check("image 绝对路径收敛 basename", mod._read_image_contract(img_json)["name"] == "x.png")
+_c = mod._read_image_contract(missing_json)
+check("image.json 缺失 → 报错口径", _c["name"] is None and "不存在" in _c["err"])
 _write(img_json, "{broken json")
-check("损坏 JSON → 报错口径", mod._read_image_contract(img_json)[0] is None)
+check("损坏 JSON → 报错口径", mod._read_image_contract(img_json)["name"] is None)
 _write(img_json, "[1, 2]")
-check("顶层数组 → 格式不符报错", "格式不符" in mod._read_image_contract(img_json)[3])
+check("顶层数组 → 格式不符报错", "格式不符" in mod._read_image_contract(img_json)["err"])
 
 print("== v1.7.0 scale 契约解析 + 边界（denoise 同纪律：坏值默认、越界收敛不报错） ==")
 check("scale 契约范围/默认常量（1.0~2.0；边长 16 倍数 clamp 64~4096）",
@@ -912,17 +914,48 @@ check("scale 契约范围/默认常量（1.0~2.0；边长 16 倍数 clamp 64~409
       and mod.IMAGE_SCALE_DEFAULT == 1.0 and mod.IMAGE_SCALE_SIDE_STEP == 16
       and mod.IMAGE_SCALE_SIDE_MIN == 64 and mod.IMAGE_SCALE_SIDE_MAX == 4096)
 _write(img_json, json.dumps({"image": "b.png", "scale": 1.5}))
-check("scale 界内原样", mod._read_image_contract(img_json) == ("b.png", 0.5, 1.5, ""))
+check("scale 界内原样", mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png", scale=1.5))
 _write(img_json, json.dumps({"image": "b.png", "scale": "1.25"}))
-check("scale 字符串宽松强转", mod._read_image_contract(img_json)[2] == 1.25)
+check("scale 字符串宽松强转", mod._read_image_contract(img_json)["scale"] == 1.25)
 _write(img_json, json.dumps({"image": "b.png", "scale": "bad"}))
-check("scale 坏值 → 默认 1.0", mod._read_image_contract(img_json)[2] == 1.0)
+check("scale 坏值 → 默认 1.0", mod._read_image_contract(img_json)["scale"] == 1.0)
 _write(img_json, '{"image": "b.png", "scale": NaN}')
-check("scale NaN 防御 → 默认 1.0", mod._read_image_contract(img_json)[2] == 1.0)
+check("scale NaN 防御 → 默认 1.0", mod._read_image_contract(img_json)["scale"] == 1.0)
 _write(img_json, json.dumps({"image": "b.png", "scale": 0.1}))
-check("scale 越界下限收敛 1.0", mod._read_image_contract(img_json)[2] == 1.0)
+check("scale 越界下限收敛 1.0", mod._read_image_contract(img_json)["scale"] == 1.0)
 _write(img_json, json.dumps({"image": "b.png", "scale": 9.9}))
-check("scale 越界上限收敛 2.0", mod._read_image_contract(img_json)[2] == 2.0)
+check("scale 越界上限收敛 2.0", mod._read_image_contract(img_json)["scale"] == 2.0)
+
+print("== v1.9.0 w/h/fit 契约解析 + 边界（目标尺寸主通道；宽容不报错） ==")
+check("fit 契约常量（三模式 + 缺省 crop + 边长护栏 8~8192）",
+      mod.IMAGE_FIT_MODES == ("crop", "pad", "stretch") and mod.IMAGE_FIT_DEFAULT == "crop"
+      and mod.IMAGE_TARGET_SIDE_MIN == 8 and mod.IMAGE_TARGET_SIDE_MAX == 8192)
+_write(img_json, json.dumps({"image": "b.png", "w": 832, "h": 1216, "fit": "pad"}))
+check("w/h/fit 界内原样", mod._read_image_contract(img_json)
+      == dict(_contract_ok, name="b.png", w=832, h=1216, fit="pad"))
+_write(img_json, json.dumps({"image": "b.png", "w": "512", "h": "768"}))
+check("w/h 字符串宽松强转 + fit 缺省 crop", mod._read_image_contract(img_json)
+      == dict(_contract_ok, name="b.png", w=512, h=768))
+_write(img_json, json.dumps({"image": "b.png", "w": "bad", "h": 768}))
+check("w 坏值 → 0（半指定回落 scale 老逻辑）", mod._read_image_contract(img_json)["w"] == 0)
+_write(img_json, json.dumps({"image": "b.png", "w": 832, "h": 0}))
+check("h=0 → 整体回落 scale", mod._read_image_contract(img_json)["h"] == 0)
+_write(img_json, json.dumps({"image": "b.png", "w": -5, "h": 768}))
+check("w 负值 → 0（回落）", mod._read_image_contract(img_json)["w"] == 0)
+_write(img_json, json.dumps({"image": "b.png", "w": 4, "h": 768}))
+check("w 越下限收敛 8（护栏不报错）", mod._read_image_contract(img_json)["w"] == 8)
+_write(img_json, json.dumps({"image": "b.png", "w": 99999, "h": 768}))
+check("w 越上限收敛 8192（显存护栏）", mod._read_image_contract(img_json)["w"] == 8192)
+_write(img_json, json.dumps({"image": "b.png", "w": 833, "h": 1215, "fit": "crop"}))
+check("非 16 倍数 w/h 照单全收（宽容——16 倍数取整在 fth 侧已完成）",
+      mod._read_image_contract(img_json)["w"] == 833)
+_write(img_json, json.dumps({"image": "b.png", "fit": "STRETCH"}))
+check("fit 大小写宽容（STRETCH → stretch）", mod._read_image_contract(img_json)["fit"] == "stretch")
+_write(img_json, json.dumps({"image": "b.png", "fit": "cover"}))
+check("fit 表外值 → 缺省 crop（不报错）", mod._read_image_contract(img_json)["fit"] == "crop")
+_write(img_json, json.dumps({"image": "b.png", "w": 832, "h": 1216, "scale": 2.0}))
+check("w/h 在场时 scale 仍解析（供旧链兜底/日志），加载层 w/h 优先",
+      mod._read_image_contract(img_json) == dict(_contract_ok, name="b.png", w=832, h=1216, scale=2.0))
 check("_scaled_size 16 倍数取整（512×768 ×2.0 → 1024×1536 原生倍数）",
       mod._scaled_size(512, 768, 2.0) == (1024, 1536))
 check("_scaled_size 最近 16 倍数 + 下限护栏（64×32 ×1.3 → 80×48→clamp 64；80×32×1.3 原生超限）",
@@ -984,7 +1017,7 @@ check("RGBA 输入图丢 alpha 成 3 通道 + denoise 缺省 0.5",
       tuple(vae2.fed[0].shape) == (1, 8, 6, 3) and denoise2 == 0.5
       and abs(float(vae2.fed[0][0, 0, 0, 0])) < 1e-6)  # 黑像素 → 0.0
 _write(img_json, json.dumps({"image": "a.png", "denoise": 1.2}))
-check("节点层 denoise 越界收敛（1.2 → 0.95）", imgin_cls().load(_MockVAE(), img_json)[1] == 0.95)
+check("节点层 denoise 越界收敛（1.2 → 1.0）", imgin_cls().load(_MockVAE(), img_json)[1] == 1.0)
 
 print("== v1.7.0 ImageInput scale：LANCZOS 放大形状（mock VAE 记录喂进形状） ==")
 _write(img_json, json.dumps({"image": "a.png", "denoise": 0.5, "scale": 2.0}))
@@ -1018,6 +1051,71 @@ check("LANCZOS 放大保内容（64×64 渐变 →128×128；角像素 0..1 归�
       tuple(_pxg.shape) == (1, 128, 128, 3)
       and abs(float(_pxg[0, 0, 0, 0])) < 2.0 / 255.0
       and abs(float(_pxg[0, 127, 127, 0]) - 252.0 / 255.0) < 4.0 / 255.0)
+
+print("== v1.9.0 ImageInput w/h/fit：目标尺寸三模式形状 + 等比正确性（mock VAE 记形状/像素） ==")
+# 底噪图：横向渐变 32×16（W×H，左红右蓝——等比性锚：横向内容比例可循）
+_band = _PIL2.new("RGB", (32, 16))
+for _x in range(32):
+    for _y in range(16):
+        _band.putpixel((_x, _y), (int(_x * 8), 0, int(255 - _x * 8)))
+_band.save(os.path.join(IMAGES_TMP, "band.png"))
+# crop：目标 16×16（输入 32×16 → cover 比率 max(0.5,1.0)=1.0 → 原尺寸居中裁切左半）
+_write(img_json, json.dumps({"image": "band.png", "denoise": 0.5, "w": 16, "h": 16, "fit": "crop"}))
+vae_cr = _MockVAE()
+imgin_cls().load(vae_cr, img_json)
+_pxcr = vae_cr.fed[0]
+check("crop 形状：32×16 → 16×16（cover 等比后居中裁切）", tuple(_pxcr.shape) == (1, 16, 16, 3))
+# crop 内容正确性：band 横向渐变（x=0 纯蓝 → x=31 纯红），cover 比率 1.0 → 原尺寸居中
+# 裁切窗=列 8..23——左缘=列 8（R≈64 蓝侧）、右缘=列 23（R≈184 红侧）、纯蓝列 0 已被裁出
+check("crop 内容：中心裁切窗=列 8..23（左缘 R≈64 蓝侧、右缘 R≈184 红侧、纯蓝列已裁出）",
+      abs(float(_pxcr[0, 8, 0, 0]) - 64.0 / 255.0) < 3.0 / 255.0
+      and abs(float(_pxcr[0, 8, 15, 0]) - 184.0 / 255.0) < 3.0 / 255.0
+      and float(_pxcr[0, 8, 0, 2]) > 180.0 / 255.0)
+# pad：目标 32×32（输入 32×16 → contain 比率 min(1.0,2.0)=1.0 → 内接 32×16 居中，
+# 上下各补 8 行=边缘像素延伸——顶行=内接图顶行复制）
+_write(img_json, json.dumps({"image": "band.png", "denoise": 0.5, "w": 32, "h": 32, "fit": "pad"}))
+vae_pd = _MockVAE()
+imgin_cls().load(vae_pd, img_json)
+_pxpd = vae_pd.fed[0]
+check("pad 形状：32×16 → 32×32（contain 等比后补边）", tuple(_pxpd.shape) == (1, 32, 32, 3))
+_torch_eq = lambda a, b: bool(_torch2.allclose(a, b, atol=1.0 / 255.0))
+check("pad 内容：补边=边缘像素延伸（顶行 ≡ 内接带顶行 y=8；底行 ≡ y=23）",
+      _torch_eq(_pxpd[0, 0], _pxpd[0, 8]) and _torch_eq(_pxpd[0, 31], _pxpd[0, 23])
+      and _torch_eq(_pxpd[0, 7], _pxpd[0, 8]) and _torch_eq(_pxpd[0, 24], _pxpd[0, 23]))
+check("pad 内容：内接带原样（y=8 行 ≡ 原图 y=0 行——等比比率 1.0 零重采样）",
+      _torch_eq(_pxpd[0, 8], _torch2.tensor(_np2.array(_band).astype("float32") / 255.0)[0]))
+# stretch：目标 16×32（纵横比 2:1 → 1:2 直接拉伸，形状精确）
+_write(img_json, json.dumps({"image": "band.png", "denoise": 0.5, "w": 16, "h": 32, "fit": "stretch"}))
+vae_st = _MockVAE()
+imgin_cls().load(vae_st, img_json)
+check("stretch 形状：32×16 → 16×32（直接拉伸不保纵横比）", tuple(vae_st.fed[0].shape) == (1, 32, 16, 3))
+# w/h 优先于 scale：w/h 在场 + scale=2.0 → 目标尺寸路径（不走 16 倍数 snap）
+_write(img_json, json.dumps({"image": "a.png", "denoise": 0.5, "w": 20, "h": 10, "fit": "stretch", "scale": 2.0}))
+vae_wo = _MockVAE()
+imgin_cls().load(vae_wo, img_json)
+check("w/h 优先于 scale（20×10 精确——非 16 倍数不 snap、scale=2.0 不生效）",
+      tuple(vae_wo.fed[0].shape) == (1, 10, 20, 3))
+# w 半指定（w 坏值 → 回落 scale 老逻辑）：a.png 6×8 ×2.0 → 16 倍数 snap + 64 下限 = 64×64
+_write(img_json, json.dumps({"image": "a.png", "denoise": 0.5, "w": "bad", "h": 64, "scale": 2.0}))
+vae_fb = _MockVAE()
+imgin_cls().load(vae_fb, img_json)
+check("w 坏值回落 scale 老逻辑（6×8 ×2.0 → 64×64 snap+护栏）", tuple(vae_fb.fed[0].shape) == (1, 64, 64, 3))
+# fit 缺省 crop：不写 fit → crop 路径（32×16 → 16×16 同 crop 断言形状）
+_write(img_json, json.dumps({"image": "band.png", "denoise": 0.5, "w": 16, "h": 16}))
+vae_dc = _MockVAE()
+imgin_cls().load(vae_dc, img_json)
+check("fit 缺省 = crop（形状同显式 crop）", tuple(vae_dc.fed[0].shape) == (1, 16, 16, 3))
+# 大目标护栏：w=8192 上限收敛（clamp 后精确 8192）
+_write(img_json, json.dumps({"image": "a.png", "denoise": 0.5, "w": 99999, "h": 64, "fit": "stretch"}))
+vae_big = _MockVAE()
+imgin_cls().load(vae_big, img_json)
+check("w=99999 收敛 8192（显存护栏路径可执行）", tuple(vae_big.fed[0].shape) == (1, 64, 8192, 3))
+# _fit_image 纯函数直测：同纵横比 crop ≡ 纯 resize（等比放大无裁边）
+_fit_src = _PIL2.new("RGB", (64, 64), (10, 20, 30))
+_fit_crop = mod._fit_image(_fit_src, 128, 128, "crop")
+check("_fit_image 纯函数：同纵横比 crop=纯放大（128×128 无裁边）", _fit_crop.size == (128, 128))
+_fit_cr2 = mod._fit_image(_band, 64, 32, "crop")
+check("_fit_image 纯函数：32×16 → 64×32 cover 等比（比率 2.0）零裁边", _fit_cr2.size == (64, 32))
 
 print("== v1.6.0 ImageInput：报错纪律（不静默直通） ==")
 
