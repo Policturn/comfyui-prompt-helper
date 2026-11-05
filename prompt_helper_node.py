@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
-"""comfyui-prompt-helper v2.0.0（架构 v2·2026-11-04）：路径直读双节点 + 编辑器联动拉起。
+"""comfyui-prompt-helper v2.1.0（线性灰度噪声蒙版·2026-11-05）：路径直读双节点 +
+线性噪声蒙版 + 编辑器联动拉起。
+
+v2.1.0（2026-11-05 用户令「我要的就是可以直接按照灰度线性对应噪声强度」）新增
+PromptHelperLinearNoiseMask：σ 门控每像素线性有效 denoise——原生 SetLatentNoiseMask
+灰度响应非线性（软阈值拐点~0.75，0.5 灰实测仅轻微效果），本节点把灰度 m 映射为
+「加入点 σ_m = m·σ_max」的时间门控：黑=全程冻结零变化 / 白=全重绘 / 0.5 灰=半程
+加入≈50% 重绘效果。机理与选型理由见 PromptHelperLinearNoiseMask 类注。
 
 v2.0.0 起六个契约节点（Inject / LoraStack / Params / Checkpoint / ImageInput /
 ImageOutput / Filter）整体退役——FeeTagHelper v2.24.0（架构 v2）起改用**图构建器**：
 编辑器按快照直接构建完整 API 格式工作流 JSON（原生节点直搭）提交 /prompt，动态参数
 （seed/steps/文本/lora/底模/输入图）全部以字面量直进图，params.json / lora_list.json /
 image.json / checkpoint.json / prompt.txt 双件 / filter_output.txt / workflow_
-snapshot.json / image_manifest.json 等契约文件机制连根退役。本插件只剩两件职能：
+snapshot.json / image_manifest.json 等契约文件机制连根退役。本插件职能：
 
 ① **路径直读双节点**（本插件存在的硬需求——2026-11-04 实测原生 LoraLoader 的
    lora_name 是 COMBO 校验，喂绝对路径 400 value_not_in_list 拒收）：
@@ -33,7 +40,7 @@ import subprocess
 import threading
 import time
 
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.1.0"
 
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(NODE_DIR, "config.json")
@@ -223,6 +230,154 @@ class PathCheckpointLoader:
 
 
 # ---------------------------------------------------------------------------
+# v2.1.0 线性灰度噪声蒙版（σ 门控每像素线性有效 denoise）
+# ---------------------------------------------------------------------------
+
+# 线性门控标记键（LATENT dict 附带键）：本节点写入，nodes.common_ksampler 桥接补丁
+# 消费后剥离——不随输出 latent 下游泄漏（链式 KSampler 不会被误触发二次门控）
+PH_LINEAR_LATENT_KEY = "ph_linear_noise_gate"
+
+
+def _linear_noise_gate(sigma, denoise_mask, extra_options=None):
+    """denoise_mask_function 钩子本体（v2.1.0 核心纯函数，逐调用无状态）：
+
+    把灰度蒙版 m（值=重绘强度 0~1）按当前步 σ 门控为 {0,1} 参与掩码——
+      加入点 σ_m = m·σ_max（σ_max=本轮采样表最大 σ，denoise<1 时即截断表的起点）；
+      当前步 σ > σ_m（即 m < σ/σ_max）→ 该像素 gate=0 全冻结；σ 降到 σ_m 后
+      gate=1 正常参与去噪。黑 m=0 恒冻结（零变化）/白 m=1 首步即加入（全重绘）/
+      0.5 灰=σ 降到 σ_max/2 才加入（≈半程去噪=50% 重绘效果）。
+
+    σ_max 从 extra_options["sigmas"] 取（KSamplerX0Inpaint 透传的完整采样表，
+    见 comfy/samplers.py KSAMPLER.sample→KSamplerX0Inpaint.__call__ 的
+    denoise_mask_function 调用点）；缺席时退化为 sigma 自身（thr=1，只有纯白参与
+    ——防御形态，正常链路不会走到）。任何取值异常按原掩码直通（不破坏采样）。"""
+    try:
+        sigmas = (extra_options or {}).get("sigmas") if isinstance(extra_options, dict) else None
+        sigma_max = float(sigmas.max()) if sigmas is not None else float(sigma.max())
+        cur = float(sigma.max())
+    except (TypeError, ValueError, AttributeError, RuntimeError):
+        return denoise_mask
+    if not (sigma_max > 0):
+        return denoise_mask
+    thr = cur / sigma_max
+    try:
+        return (denoise_mask.clamp(0.0, 1.0) >= thr).to(denoise_mask.dtype)
+    except (AttributeError, RuntimeError):
+        return denoise_mask
+
+
+def _install_linear_gate_bridge():
+    """装载 nodes.common_ksampler 桥接补丁（模块装载时调用，幂等）。
+
+    为什么需要补丁：sampler_post_cfg_function / denoise_mask_function 都登记在
+    ModelPatcher.model_options（MODEL 链）上，而本节点输入面只有 LATENT+MASK
+    （与原生 SetLatentNoiseMask 同面——fth 图构建器零额外接线即可替换）。唯一从
+    LATENT dict 通到采样器的公共通道是 latent["noise_mask"]，其每步门控钩子
+    （comfy/samplers.py KSamplerX0Inpaint.__call__）从 model_options 读
+    denoise_mask_function——故在本模块装载时补 common_ksampler（KSampler /
+    KSamplerAdvanced 两节点的公共采样入口，节点方法按模块全局名解析、补丁即生效）：
+    见 PH_LINEAR_LATENT_KEY 标记的 latent → 把 _linear_noise_gate 登记进
+    model.model_options["denoise_mask_function"]（try/finally 原值恢复——不动共享
+    MODEL 的持久状态），标记键剥离防下游泄漏。无标记的 latent 原样直通（零开销）。
+
+    SamplerCustom 路径不经 common_ksampler：标记不消费，蒙版按原生
+    SetLatentNoiseMask 语义生效（优雅降级，fth 图构建器走 KSampler 不受影响）。"""
+    try:
+        import nodes as _nodes
+    except ImportError:
+        return False  # 离线测试环境（无 ComfyUI 壳）——节点逻辑仍可单测
+    orig = getattr(_nodes, "common_ksampler", None)
+    if orig is None or getattr(orig, "_ph_linear_gate_bridge", False):
+        return True  # seam 缺席（ComfyUI 版本变动）/ 已装（模块重载幂等）
+
+    def common_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent,
+                        denoise=1.0, disable_noise=False, start_step=None, last_step=None,
+                        force_full_denoise=False, _ph_orig=orig):
+        if isinstance(latent, dict) and latent.get(PH_LINEAR_LATENT_KEY) and "noise_mask" in latent:
+            clean = {k: v for k, v in latent.items() if k != PH_LINEAR_LATENT_KEY}
+            mo = getattr(model, "model_options", None)
+            if isinstance(mo, dict):
+                prev = mo.get("denoise_mask_function")
+                mo["denoise_mask_function"] = _linear_noise_gate
+                try:
+                    return _ph_orig(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, clean,
+                                    denoise=denoise, disable_noise=disable_noise, start_step=start_step,
+                                    last_step=last_step, force_full_denoise=force_full_denoise)
+                finally:
+                    if prev is None:
+                        mo.pop("denoise_mask_function", None)
+                    else:
+                        mo["denoise_mask_function"] = prev
+        return _ph_orig(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent,
+                        denoise=denoise, disable_noise=disable_noise, start_step=start_step,
+                        last_step=last_step, force_full_denoise=force_full_denoise)
+
+    common_ksampler._ph_linear_gate_bridge = True
+    _nodes.common_ksampler = common_ksampler
+    return True
+
+
+class PromptHelperLinearNoiseMask:
+    """线性灰度噪声蒙版（v2.1.0）：samples(LATENT)+mask(MASK) → LATENT。
+
+    需求（2026-11-05 用户令）：灰度线性对应噪声强度——0.5 灰=恰 50% 重绘效果。
+    原生 SetLatentNoiseMask 灰度响应非线性（软阈值拐点~0.75，0.5 灰实测仅轻微
+    效果）：其每步按 m 连续混合 x 与再噪化 latent，采样动力学把幅值混合整流成
+    阈值响应。本节点改为**时间门控**：灰度 m 的加入点 σ_m=m·σ_max，σ>σ_m 期间
+    该像素完全冻结在原 latent（输入侧 x=按当前 σ 再噪化的原 latent、输出侧 x0=原
+    latent——与 mask=0 的原生冻结路径逐位一致），σ 降到 σ_m 后整像素参与去噪。
+    加入时刻像素状态恰为「从 σ_m 起步的 img2img」——线性 m=线性有效 denoise。
+
+    钩子选型（任务书勘明 sampler_post_cfg_function，实现改挂 denoise_mask_function
+    的理由）：①冻结必须同时作用于**输入 x 与输出 x0**两侧——KSamplerX0Inpaint 的
+    原生冻结链（comfy/samplers.py 634-643：x*scale_latent_inpaint 回拉 + 输出钉
+    latent_image）两侧齐备且按模型类型（EPS/V/EDM/flow）各自正确的 noise_scaling
+    再噪化；post-CFG 只能改 denoised 估计，冻结像素的模型输入 x 在 SDE/多步采样器
+    下会累积未跟踪的新噪声（fresh noise 无人去除→终点漂移）；②门控即把 denoise_mask
+    按步二值化（denoise_mask_function 正是官方给的时间相关掩码钩子），加入像素
+    gate=1 时行为与无蒙版全重绘逐位一致，零幅值混合=零软阈值伪影；③与原生
+    SetLatentNoiseMask 叠加语义：上游区域 noise_mask 在场时先收（逐像素相乘，
+    区域外 m=0 恒冻结），线性强度后调。注册路径说明见 _install_linear_gate_bridge。
+
+    局限（如实）：批量 batch>1 且两掩码 batch 维均 >1 且不等时不广播（报错可见）；
+    SamplerCustom 链按原生语义降级（见 _install_linear_gate_bridge 注）。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT", {"tooltip": "输入 latent（VAEEncode 产物；上游带 SetLatentNoiseMask 区域蒙版时先收区域、线性强度后调）"}),
+                "mask": ("MASK", {"tooltip": "灰度蒙版：值=线性重绘强度（白 1=全重绘 / 黑 0=零变化 / 0.5=半程加入≈50% 重绘效果）——替代 SetLatentNoiseMask 的非线性灰度响应"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    OUTPUT_TOOLTIPS = ("带线性灰度噪声蒙版的 latent（接 KSampler——黑位逐位零变化）。",)
+    FUNCTION = "apply_linear"
+    CATEGORY = "model/latent"
+    DESCRIPTION = ("线性灰度噪声蒙版（替代 SetLatentNoiseMask 的线性版）：σ 门控每像素线性有效 denoise——"
+                   "灰度 m 的加入点 σ_m=m·σ_max，σ 降到 σ_m 前该像素完全冻结原 latent、之后正常去噪。"
+                   "黑=零变化/白=全重绘/0.5 灰≈50% 重绘效果。需接 KSampler/KSamplerAdvanced（SamplerCustom 链按原生语义降级）。")
+    SEARCH_ALIASES = ["linear noise mask", "线性 重绘 强度", "fth linear mask"]
+
+    def apply_linear(self, samples, mask):
+        s = samples.copy()
+        m = mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1])).float()
+        region = s.get("noise_mask")
+        if region is not None:
+            # 区域 mask 先收（上游 SetLatentNoiseMask/VAEEncode(inpaint) 在场）：
+            # 逐像素相乘——区域 0 处 m=0 恒冻结；空间尺寸不一致时区域蒙版双线性
+            # 缩到本蒙版尺寸（batch 维靠广播）
+            if tuple(region.shape[-2:]) != tuple(m.shape[-2:]):
+                import torch.nn.functional as F
+                region = F.interpolate(region, size=m.shape[-2:], mode="bilinear", align_corners=False)
+            m = m * region
+        s["noise_mask"] = m                      # 触发 KSamplerX0Inpaint 每步冻结链（值=m）
+        s[PH_LINEAR_LATENT_KEY] = True           # common_ksampler 桥接标记（消费即剥离）
+        return (s,)
+
+
+# ---------------------------------------------------------------------------
 # 编辑器联动拉起（v1.x 全量保留——v2.0.0 唯一不变职能）
 # ---------------------------------------------------------------------------
 
@@ -391,8 +546,13 @@ def autostart_editor():
 NODE_CLASS_MAPPINGS = {
     "PathLoraLoader": PathLoraLoader,
     "PathCheckpointLoader": PathCheckpointLoader,
+    "PromptHelperLinearNoiseMask": PromptHelperLinearNoiseMask,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PathLoraLoader": "LoRA 路径直读 (prompt-helper)",
     "PathCheckpointLoader": "底模路径直读 (prompt-helper)",
+    "PromptHelperLinearNoiseMask": "线性灰度噪声蒙版 (prompt-helper)",
 }
+
+# v2.1.0 线性噪声蒙版桥接补丁（幂等——见 _install_linear_gate_bridge 注）
+_install_linear_gate_bridge()
