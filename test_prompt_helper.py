@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""离线自测（v2.0.0 大瘦身版）：不启动 ComfyUI，直接加载节点模块验证逻辑。
+"""离线自测（v2.1.0）：不启动 ComfyUI，直接加载节点模块验证逻辑。
 
-覆盖面：路径直读双节点（_resolve_model_path 纯函数面 + comfy 桩注入的加载链）
-与编辑器联动拉起族（v1.x 保留面）。v1.x 的六契约节点/契约文件读侧/模板结构
-断言随节点删除整体退役（历史用例见 git）。
+覆盖面：路径直读双节点（_resolve_model_path 纯函数面 + comfy 桩注入的加载链）、
+线性灰度噪声蒙版（v2.1.0：_linear_noise_gate σ 门控纯函数 + 节点输入输出面 +
+common_ksampler 桥接补丁）与编辑器联动拉起族（v1.x 保留面）。v1.x 的六契约节点/
+契约文件读侧/模板结构断言随节点删除整体退役（历史用例见 git）。
 
-用法：python test_prompt_helper.py
+用法：python test_prompt_helper.py（真 torch 用 ComfyUI 环境 python 跑——门控用例
+依赖张量语义；无 torch 环境跑则门控/节点段按缺库跳过计 PASS-SKIP）
 """
 
 import importlib.util
@@ -97,9 +99,9 @@ def fake_comfy_modules(torch_calls, lora_calls, ckpt_calls):
 # == 版本与注册 ==
 
 print("== 版本与注册 ==")
-check("PLUGIN_VERSION = 2.0.0", mod.PLUGIN_VERSION == "2.0.0")
-check("注册面恰为路径双节点（六节点缩编完成）",
-      set(mod.NODE_CLASS_MAPPINGS) == {"PathLoraLoader", "PathCheckpointLoader"})
+check("PLUGIN_VERSION = 2.1.0", mod.PLUGIN_VERSION == "2.1.0")
+check("注册面恰为三节点（路径双节点+线性噪声蒙版）",
+      set(mod.NODE_CLASS_MAPPINGS) == {"PathLoraLoader", "PathCheckpointLoader", "PromptHelperLinearNoiseMask"})
 check("显示名已配置", set(mod.NODE_DISPLAY_NAME_MAPPINGS) == set(mod.NODE_CLASS_MAPPINGS))
 
 # == _resolve_model_path（纯函数面） ==
@@ -174,6 +176,120 @@ check("load_checkpoint_guess_config 收完整路径 + vae/clip 全开 + embeddin
       and ckpt_calls[0]["vae"] and ckpt_calls[0]["clip"] and ckpt_calls[0]["emb"] == [r"C:\emb"])
 expect_raises("底模坏路径可见报错",
               lambda: node2.load_checkpoint(os.path.join(TMP_DIR, "ghost.safetensors")))
+
+# == 线性灰度噪声蒙版（v2.1.0） ==
+
+print("== 线性灰度噪声蒙版（v2.1.0） ==")
+try:
+    import torch  # noqa: F401
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    print("  PASS-SKIP  本环境无 torch——门控/节点执行面用例跳过（ComfyUI 环境跑全量）")
+
+if HAS_TORCH:
+    import torch
+
+    # —— _linear_noise_gate（σ 门控纯函数）——
+    sigmas = torch.tensor([14.0, 10.0, 7.0, 4.0, 2.0, 0.9, 0.0])   # 降序采样表：σ_max=14
+    m = torch.tensor([[[[0.0, 0.25], [0.5, 1.0]]]])                 # [1,1,2,2] 四档灰度
+    # 首步 σ=σ_max：thr=1 → 只有纯白 m>=1 加入
+    g = mod._linear_noise_gate(torch.tensor([14.0]), m.clone(), {"sigmas": sigmas})
+    check("首步 σ=σ_max：仅纯白加入（黑/0.25/0.5 全冻结）",
+          g.tolist() == [[[[0.0, 0.0], [0.0, 1.0]]]] and g.dtype == m.dtype)
+    # σ=7=0.5·σ_max：thr=0.5 → m>=0.5 加入（0.5 恰在加入点——边界含等）
+    g = mod._linear_noise_gate(torch.tensor([7.0]), m.clone(), {"sigmas": sigmas})
+    check("σ=0.5·σ_max：m>=0.5 加入（0.5 恰达加入点，含等）",
+          g.tolist() == [[[[0.0, 0.0], [1.0, 1.0]]]])
+    # σ=4：thr≈0.2857 → 0.25 仍冻结 / 0.5 已加入
+    g = mod._linear_noise_gate(torch.tensor([4.0]), m.clone(), {"sigmas": sigmas})
+    check("σ=4：thr≈0.286——0.25 冻结 / 0.5+ 加入", g.tolist() == [[[[0.0, 0.0], [1.0, 1.0]]]])
+    # σ=2：thr≈0.143 → 0.25 加入
+    g = mod._linear_noise_gate(torch.tensor([2.0]), m.clone(), {"sigmas": sigmas})
+    check("σ=2：0.25 也加入（仅黑恒冻结）", g.tolist() == [[[[0.0, 1.0], [1.0, 1.0]]]])
+    # 钳制：越界值收 [0,1] 再门控
+    m2 = torch.tensor([[[[1.7, -0.3]]]])
+    g = mod._linear_noise_gate(torch.tensor([14.0]), m2, {"sigmas": sigmas})
+    check("越界灰度钳制（1.7→加入 / -0.3→冻结）", g.tolist() == [[[[1.0, 0.0]]]])
+    # sigmas 缺席防御：退化为 thr=1（只有纯白通过），不抛错
+    g = mod._linear_noise_gate(torch.tensor([3.3]), torch.tensor([[[[1.0, 0.9]]]]), None)
+    check("extra_options 缺席防御：thr=1 纯白直通不抛", g.tolist() == [[[[1.0, 0.0]]]])
+    # 非 dict extra_options / σ=0 退化直通
+    check("σ_max=0（空表）按原掩码直通",
+          mod._linear_noise_gate(torch.tensor([0.0]), m.clone(), {"sigmas": torch.tensor([0.0])}).tolist() == m.tolist())
+
+    # —— PromptHelperLinearNoiseMask（节点面）——
+    inputs = mod.PromptHelperLinearNoiseMask.INPUT_TYPES()["required"]
+    check("输入面 = samples+mask（与原生 SetLatentNoiseMask 同面）",
+          set(inputs) == {"samples", "mask"})
+    check("输出 = (LATENT,)", mod.PromptHelperLinearNoiseMask.RETURN_TYPES == ("LATENT",))
+    node3 = mod.PromptHelperLinearNoiseMask()
+    lat = {"samples": torch.zeros(1, 4, 8, 8)}
+    mask_in = torch.tensor([[[[0.0, 0.5], [1.0, 0.5]]]])
+    out = node3.apply_linear(lat, mask_in)[0]
+    check("noise_mask=灰度值直存（reshape [-1,1,h,w] float）",
+          torch.equal(out["noise_mask"], torch.tensor([[[[0.0, 0.5], [1.0, 0.5]]]]))
+          and out["noise_mask"].dtype == torch.float32)
+    check("线性门控标记键写入（消费方=common_ksampler 桥）", out.get(mod.PH_LINEAR_LATENT_KEY) is True)
+    check("samples 原 dict 不被改写（拷贝语义）", "noise_mask" not in lat and mod.PH_LINEAR_LATENT_KEY not in lat)
+    check("samples 张量原样透传", torch.equal(out["samples"], lat["samples"]))
+    # 叠加语义：上游区域 noise_mask 先收（逐像素相乘）
+    lat_region = {"samples": torch.zeros(1, 4, 8, 8), "noise_mask": torch.tensor([[[[1.0, 0.0], [1.0, 1.0]]]])}
+    out2 = node3.apply_linear(lat_region, mask_in)[0]
+    check("区域 mask 先收：区域 0 处 m=0（恒冻结），区域内 m=线性强度",
+          torch.equal(out2["noise_mask"], torch.tensor([[[[0.0, 0.0], [1.0, 0.5]]]])))
+    # 区域蒙版尺寸不一致：双线性缩到本蒙版尺寸
+    lat_big = {"samples": torch.zeros(1, 4, 8, 8), "noise_mask": torch.ones(1, 1, 4, 4)}
+    out3 = node3.apply_linear(lat_big, mask_in)[0]
+    check("区域蒙版尺寸不一致自动对齐（4×4→2×2）", tuple(out3["noise_mask"].shape) == (1, 1, 2, 2))
+
+# —— common_ksampler 桥接补丁（伪造 nodes 模块验证登记/恢复/剥离/直通）——
+calls = []
+mo_seen = []
+
+
+class _FakeModel:
+    def __init__(self):
+        self.model_options = {}
+
+
+def _fake_orig(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, **kw):
+    calls.append({"latent_keys": sorted(latent.keys()), "denoise": kw.get("denoise"), "start_step": kw.get("start_step")})
+    mo_seen.append(dict(model.model_options))
+    return {"samples": "stub-out"}
+
+
+fake_nodes = types.ModuleType("nodes")
+fake_nodes.common_ksampler = _fake_orig
+sys.modules["nodes"] = fake_nodes
+try:
+    ok = mod._install_linear_gate_bridge()
+    check("桥接补丁装载成功", ok is True and getattr(fake_nodes.common_ksampler, "_ph_linear_gate_bridge", False))
+    wrapper_first = fake_nodes.common_ksampler
+    check("包装器内层即原函数（__defaults__ 缺省参绑定）", _fake_orig in (wrapper_first.__defaults__ or ()))
+    mod._install_linear_gate_bridge()
+    check("幂等重装（同一包装器对象，不再包一层）", fake_nodes.common_ksampler is wrapper_first)
+    # 标记 latent：登记-剥离-恢复全链
+    model = _FakeModel()
+    model.model_options["denoise_mask_function"] = "prev-fn"      # 预置他人钩子——finally 必须原值恢复
+    lat_marked = {"samples": "s", "noise_mask": "m", mod.PH_LINEAR_LATENT_KEY: True}
+    r = fake_nodes.common_ksampler(model, 7, 20, 5.0, "euler", "karras", "pos", "neg", lat_marked, denoise=0.7)
+    check("标记轮：原函数被调且标记键剥离不外漏",
+          r == {"samples": "stub-out"} and calls[-1]["latent_keys"] == ["noise_mask", "samples"] and calls[-1]["denoise"] == 0.7)
+    check("标记轮：门控函数登记进 model_options（原函数视角）", mo_seen[-1]["denoise_mask_function"] is mod._linear_noise_gate)
+    check("标记轮：finally 原值恢复（他人钩子不被吞）", model.model_options["denoise_mask_function"] == "prev-fn")
+    # 无标记 latent：原样直通（同对象、model_options 零动作）
+    lat_plain = {"samples": "s2"}
+    r2 = fake_nodes.common_ksampler(model, 1, 20, 5.0, "euler", "karras", "p", "n", lat_plain)
+    check("无标记轮：原样直通零登记",
+          r2 == {"samples": "stub-out"} and calls[-1]["latent_keys"] == ["samples"]
+          and mo_seen[-1].get("denoise_mask_function") == "prev-fn")
+    # 标记但缺 noise_mask（防御形态）：直通不登记
+    lat_nomask = {"samples": "s3", mod.PH_LINEAR_LATENT_KEY: True}
+    fake_nodes.common_ksampler(model, 1, 20, 5.0, "euler", "karras", "p", "n", lat_nomask)
+    check("标记但无 noise_mask：直通（门控无从生效不误挂）", calls[-1]["latent_keys"] == [mod.PH_LINEAR_LATENT_KEY, "samples"])
+finally:
+    sys.modules.pop("nodes", None)
 
 # 清桩（避免影响后续编辑器族用例对 sys.modules 的假设）
 for name in ("comfy", "comfy.utils", "comfy.sd", "folder_paths"):
