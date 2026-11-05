@@ -3,10 +3,11 @@
 线性噪声蒙版 + 编辑器联动拉起。
 
 v2.1.0（2026-11-05 用户令「我要的就是可以直接按照灰度线性对应噪声强度」）新增
-PromptHelperLinearNoiseMask：σ 门控每像素线性有效 denoise——原生 SetLatentNoiseMask
+PromptHelperLinearNoiseMask：时间门控每像素线性有效 denoise——原生 SetLatentNoiseMask
 灰度响应非线性（软阈值拐点~0.75，0.5 灰实测仅轻微效果），本节点把灰度 m 映射为
-「加入点 σ_m = m·σ_max」的时间门控：黑=全程冻结零变化 / 白=全重绘 / 0.5 灰=半程
-加入≈50% 重绘效果。机理与选型理由见 PromptHelperLinearNoiseMask 类注。
+「加入点=步数进度 (1-m^CAL) 处」的时间门控（CAL=效果线性定标指数，E2E 实测）：
+黑=全程冻结零变化 / 白=全重绘 / 0.5 灰≈50% 重绘效果。机理与选型理由（含 σ 线性/
+步数线性/效果定标三档 E2E 数据）见 PromptHelperLinearNoiseMask 类注。
 
 v2.0.0 起六个契约节点（Inject / LoraStack / Params / Checkpoint / ImageInput /
 ImageOutput / Filter）整体退役——FeeTagHelper v2.24.0（架构 v2）起改用**图构建器**：
@@ -238,30 +239,60 @@ class PathCheckpointLoader:
 PH_LINEAR_LATENT_KEY = "ph_linear_noise_gate"
 
 
+# 效果线性定标指数（件四 E2E 实测，2026-11-05，tmp/linear-proof/）：SD 系模型
+# denoise→像素变化响应为凸函数——纯步数刻度（有效 denoise=灰度 g）实测归一效果
+# 0.25/0.5/0.75 档=0.16/0.32/0.65（0.5 档欠 0.5±0.15 带宽）。有效 denoise 取
+# g^CAL（CAL=0.7，四锚点拟合：预测 0.25/0.5/0.75 档效果≈0.24/0.50/0.73）把响应
+# 等化回灰度线性。端点恒定：g=0 恒冻结 / g=1 首步即加入（不受指数影响）。
+# 定标链：waiIllustriousSDXL_v160 + euler/normal 28 步 + CFG 6.5 + denoise 1.0。
+_LINEAR_CAL = 0.7
+
+
 def _linear_noise_gate(sigma, denoise_mask, extra_options=None):
     """denoise_mask_function 钩子本体（v2.1.0 核心纯函数，逐调用无状态）：
 
-    把灰度蒙版 m（值=重绘强度 0~1）按当前步 σ 门控为 {0,1} 参与掩码——
-      加入点 σ_m = m·σ_max（σ_max=本轮采样表最大 σ，denoise<1 时即截断表的起点）；
-      当前步 σ > σ_m（即 m < σ/σ_max）→ 该像素 gate=0 全冻结；σ 降到 σ_m 后
-      gate=1 正常参与去噪。黑 m=0 恒冻结（零变化）/白 m=1 首步即加入（全重绘）/
-      0.5 灰=σ 降到 σ_max/2 才加入（≈半程去噪=50% 重绘效果）。
+    把灰度蒙版 m（值=重绘强度 0~1）按采样进度门控为 {0,1} 参与掩码——
+      有效 denoise = m^_LINEAR_CAL（效果线性定标，见常量注）；加入点=步数进度
+      (1-有效 denoise) 处（σ_m = sigmas[round((1-m^CAL)·N)]，N=本轮模型调用数）：
+      当前进度 i/N ≥ 1-m^CAL（即 m ≥ (1-i/N)^(1/CAL)）→ gate=1 正常参与去噪；
+      此前 gate=0 全冻结。黑 m=0 恒冻结（零变化）/白 m=1 首步即加入（全重绘）/
+      0.5 灰≈50% 重绘效果（效果空间线性——件四 E2E 实测落 0.5±0.15 带宽）。
 
-    σ_max 从 extra_options["sigmas"] 取（KSamplerX0Inpaint 透传的完整采样表，
-    见 comfy/samplers.py KSAMPLER.sample→KSamplerX0Inpaint.__call__ 的
-    denoise_mask_function 调用点）；缺席时退化为 sigma 自身（thr=1，只有纯白参与
-    ——防御形态，正常链路不会走到）。任何取值异常按原掩码直通（不破坏采样）。"""
+    刻度选型（件四 E2E 实测定标，2026-11-05）：①σ 空间线性（σ_m=m·σ_max，任务书
+    初稿机理）实测 0.5 档效果≈0.96——SD 系采样表在高 σ 段极陡，σ 降到 0.5·σ_max
+    时步数进度已 ~86%，效果近饱和；②纯步数线性（有效 denoise=灰度）实测 0.5 档
+    效果=0.32——模型 denoise→变化响应凸性；③本实现=②加定标指数（_LINEAR_CAL），
+    效果空间线性成立。
+
+    当前进度 i 由 sigmas（extra_options["sigmas"]——KSamplerX0Inpaint 透传的完整
+    采样表，见 comfy/samplers.py 的 denoise_mask_function 调用点）计数得出；sigmas
+    缺席时退化为 σ 比阈（thr=1，只有纯白参与——防御形态，正常链路不会走到）。任何
+    取值异常按原掩码直通（不破坏采样）。"""
     try:
-        sigmas = (extra_options or {}).get("sigmas") if isinstance(extra_options, dict) else None
-        sigma_max = float(sigmas.max()) if sigmas is not None else float(sigma.max())
         cur = float(sigma.max())
     except (TypeError, ValueError, AttributeError, RuntimeError):
         return denoise_mask
-    if not (sigma_max > 0):
-        return denoise_mask
-    thr = cur / sigma_max
     try:
-        return (denoise_mask.clamp(0.0, 1.0) >= thr).to(denoise_mask.dtype)
+        m = denoise_mask.clamp(0.0, 1.0)
+    except (AttributeError, RuntimeError):
+        return denoise_mask
+    sigmas = extra_options.get("sigmas") if isinstance(extra_options, dict) else None
+    try:
+        if sigmas is not None and len(sigmas) >= 2:
+            # 降序采样表：i=严格大于当前 σ 的条目数=当前调用序号（0 基）；
+            # N=模型调用数（表长-1，末位是终态 0）。容差比较吸收 s_churn 的 sigma_hat 微差。
+            import torch as _torch
+            i = int((sigmas > _torch.tensor(cur, dtype=sigmas.dtype, device=sigmas.device) * (1 + 1e-6)).sum().item())
+            n = len(sigmas) - 1
+            thr = max(1.0 - float(i) / float(n), 0.0)
+            thr = thr ** (1.0 / _LINEAR_CAL)          # m >= thr ⟺ 进度 i/n >= 1-m^CAL
+        else:
+            sigma_max = float(sigmas.max()) if sigmas is not None else cur
+            thr = cur / sigma_max if sigma_max > 0 else 1.0
+    except (TypeError, ValueError, AttributeError, RuntimeError):
+        return denoise_mask
+    try:
+        return (m >= thr).to(denoise_mask.dtype)
     except (AttributeError, RuntimeError):
         return denoise_mask
 
@@ -323,10 +354,13 @@ class PromptHelperLinearNoiseMask:
     需求（2026-11-05 用户令）：灰度线性对应噪声强度——0.5 灰=恰 50% 重绘效果。
     原生 SetLatentNoiseMask 灰度响应非线性（软阈值拐点~0.75，0.5 灰实测仅轻微
     效果）：其每步按 m 连续混合 x 与再噪化 latent，采样动力学把幅值混合整流成
-    阈值响应。本节点改为**时间门控**：灰度 m 的加入点 σ_m=m·σ_max，σ>σ_m 期间
-    该像素完全冻结在原 latent（输入侧 x=按当前 σ 再噪化的原 latent、输出侧 x0=原
-    latent——与 mask=0 的原生冻结路径逐位一致），σ 降到 σ_m 后整像素参与去噪。
-    加入时刻像素状态恰为「从 σ_m 起步的 img2img」——线性 m=线性有效 denoise。
+    阈值响应。本节点改为**时间门控**：灰度 m 的有效 denoise=m^_LINEAR_CAL（效果
+    线性定标指数，件四 E2E 实测——SD 系 denoise→像素变化响应为凸函数，恒等刻度
+    0.5 档仅 0.32 归一效果，定标后 0.5 档≈0.5）——加入点=步数进度 (1-m^CAL) 处
+    （σ_m=sigmas[round((1-m^CAL)·N)]），此前该像素完全冻结在原 latent（输入侧
+    x=按当前 σ 再噪化的原 latent、输出侧 x0=原 latent——与 mask=0 的原生冻结路径
+    逐位一致），到点后整像素参与去噪。加入时刻像素状态恰为「从 σ_m 起步的
+    img2img」。黑/白端点恒定：m=0 全程冻结零变化 / m=1 首步加入全重绘。
 
     钩子选型（任务书勘明 sampler_post_cfg_function，实现改挂 denoise_mask_function
     的理由）：①冻结必须同时作用于**输入 x 与输出 x0**两侧——KSamplerX0Inpaint 的
@@ -347,7 +381,7 @@ class PromptHelperLinearNoiseMask:
         return {
             "required": {
                 "samples": ("LATENT", {"tooltip": "输入 latent（VAEEncode 产物；上游带 SetLatentNoiseMask 区域蒙版时先收区域、线性强度后调）"}),
-                "mask": ("MASK", {"tooltip": "灰度蒙版：值=线性重绘强度（白 1=全重绘 / 黑 0=零变化 / 0.5=半程加入≈50% 重绘效果）——替代 SetLatentNoiseMask 的非线性灰度响应"}),
+                "mask": ("MASK", {"tooltip": "灰度蒙版：值=线性重绘强度=有效 denoise（白 1=全重绘 / 黑 0=零变化 / 0.5=后半程加入=50% 重绘效果）——替代 SetLatentNoiseMask 的非线性灰度响应"}),
             }
         }
 
@@ -355,8 +389,8 @@ class PromptHelperLinearNoiseMask:
     OUTPUT_TOOLTIPS = ("带线性灰度噪声蒙版的 latent（接 KSampler——黑位逐位零变化）。",)
     FUNCTION = "apply_linear"
     CATEGORY = "model/latent"
-    DESCRIPTION = ("线性灰度噪声蒙版（替代 SetLatentNoiseMask 的线性版）：σ 门控每像素线性有效 denoise——"
-                   "灰度 m 的加入点 σ_m=m·σ_max，σ 降到 σ_m 前该像素完全冻结原 latent、之后正常去噪。"
+    DESCRIPTION = ("线性灰度噪声蒙版（替代 SetLatentNoiseMask 的线性版）：时间门控每像素线性有效 denoise——"
+                   "灰度 m 的加入点=步数进度 (1-m) 处（与 img2img denoise 同刻度），到点前该像素完全冻结原 latent、之后正常去噪。"
                    "黑=零变化/白=全重绘/0.5 灰≈50% 重绘效果。需接 KSampler/KSamplerAdvanced（SamplerCustom 链按原生语义降级）。")
     SEARCH_ALIASES = ["linear noise mask", "线性 重绘 强度", "fth linear mask"]
 

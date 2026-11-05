@@ -190,33 +190,38 @@ except ImportError:
 if HAS_TORCH:
     import torch
 
-    # —— _linear_noise_gate（σ 门控纯函数）——
-    sigmas = torch.tensor([14.0, 10.0, 7.0, 4.0, 2.0, 0.9, 0.0])   # 降序采样表：σ_max=14
+    # —— _linear_noise_gate（步数进度门控+效果定标纯函数）——
+    # 采样表 7 条=6 次模型调用（末位 0 是终态）；加入 ⟺ m >= (1-i/N)^(1/CAL)（i=当前调用序号，CAL=0.7）
+    cal = mod._LINEAR_CAL
+    check("定标指数在册（0.7——E2E 四锚点拟合）", abs(cal - 0.7) < 1e-9)
+    sigmas = torch.tensor([14.0, 10.0, 7.0, 4.0, 2.0, 0.9, 0.0])
     m = torch.tensor([[[[0.0, 0.25], [0.5, 1.0]]]])                 # [1,1,2,2] 四档灰度
-    # 首步 σ=σ_max：thr=1 → 只有纯白 m>=1 加入
+    # 首步 i=0/N=6 → thr=1.0（1 的任意幂=1）：仅纯白 m>=1 加入
     g = mod._linear_noise_gate(torch.tensor([14.0]), m.clone(), {"sigmas": sigmas})
-    check("首步 σ=σ_max：仅纯白加入（黑/0.25/0.5 全冻结）",
+    check("首步（进度 0）：仅纯白加入（黑/0.25/0.5 全冻结）",
           g.tolist() == [[[[0.0, 0.0], [0.0, 1.0]]]] and g.dtype == m.dtype)
-    # σ=7=0.5·σ_max：thr=0.5 → m>=0.5 加入（0.5 恰在加入点——边界含等）
+    # 第 3 次调用 σ=7（i=2/N=6 → raw=0.667 → thr=0.667^(1/0.7)≈0.545）：0.5 未达加入点仍冻结
     g = mod._linear_noise_gate(torch.tensor([7.0]), m.clone(), {"sigmas": sigmas})
-    check("σ=0.5·σ_max：m>=0.5 加入（0.5 恰达加入点，含等）",
-          g.tolist() == [[[[0.0, 0.0], [1.0, 1.0]]]])
-    # σ=4：thr≈0.2857 → 0.25 仍冻结 / 0.5 已加入
+    check("进度 2/6：thr≈0.545——0.5 冻结 / 1 加入", g.tolist() == [[[[0.0, 0.0], [0.0, 1.0]]]])
+    # 第 4 次调用 σ=4（i=3 → raw=0.5 → thr=0.5^(1/0.7)≈0.378）：0.5 已过加入点 / 0.25 冻结
     g = mod._linear_noise_gate(torch.tensor([4.0]), m.clone(), {"sigmas": sigmas})
-    check("σ=4：thr≈0.286——0.25 冻结 / 0.5+ 加入", g.tolist() == [[[[0.0, 0.0], [1.0, 1.0]]]])
-    # σ=2：thr≈0.143 → 0.25 加入
-    g = mod._linear_noise_gate(torch.tensor([2.0]), m.clone(), {"sigmas": sigmas})
-    check("σ=2：0.25 也加入（仅黑恒冻结）", g.tolist() == [[[[0.0, 1.0], [1.0, 1.0]]]])
+    check("进度 3/6（过半）：thr≈0.378——0.5 加入 / 0.25 冻结", g.tolist() == [[[[0.0, 0.0], [1.0, 1.0]]]])
+    # 末次调用 σ=0.9（i=5 → raw≈0.167 → thr≈0.076）：0.25 已过加入点；黑恒冻结（端点不受定标影响）
+    g = mod._linear_noise_gate(torch.tensor([0.9]), m.clone(), {"sigmas": sigmas})
+    check("进度 5/6：thr≈0.076——0.25+ 加入（仅黑恒冻结）", g.tolist() == [[[[0.0, 1.0], [1.0, 1.0]]]])
+    # 0.5 灰加入点=进度 1-0.5^0.7≈0.385（28 步表 i=10.7 → 第 11 次调用加入、第 10 次仍冻结）
+    sig28 = torch.linspace(14.6, 0.0, 29)   # 降序 29 条=28 调用
+    g = mod._linear_noise_gate(torch.tensor(float(sig28[10])), torch.tensor([[[[0.5]]]]), {"sigmas": sig28})
+    check("28 步表 i=10（进度 0.37<0.385）：0.5 灰仍冻结", g.tolist() == [[[[0.0]]]])
+    g = mod._linear_noise_gate(torch.tensor(float(sig28[11])), torch.tensor([[[[0.5]]]]), {"sigmas": sig28})
+    check("28 步表 i=11（进度 0.407≥0.385）：0.5 灰加入", g.tolist() == [[[[1.0]]]])
     # 钳制：越界值收 [0,1] 再门控
     m2 = torch.tensor([[[[1.7, -0.3]]]])
     g = mod._linear_noise_gate(torch.tensor([14.0]), m2, {"sigmas": sigmas})
     check("越界灰度钳制（1.7→加入 / -0.3→冻结）", g.tolist() == [[[[1.0, 0.0]]]])
-    # sigmas 缺席防御：退化为 thr=1（只有纯白通过），不抛错
+    # sigmas 缺席防御：退化为 σ 比阈（thr=cur/σ_max，单点时=1——只有纯白通过），不抛错
     g = mod._linear_noise_gate(torch.tensor([3.3]), torch.tensor([[[[1.0, 0.9]]]]), None)
-    check("extra_options 缺席防御：thr=1 纯白直通不抛", g.tolist() == [[[[1.0, 0.0]]]])
-    # 非 dict extra_options / σ=0 退化直通
-    check("σ_max=0（空表）按原掩码直通",
-          mod._linear_noise_gate(torch.tensor([0.0]), m.clone(), {"sigmas": torch.tensor([0.0])}).tolist() == m.tolist())
+    check("extra_options 缺席防御：退化为 σ 比阈纯白直通不抛", g.tolist() == [[[[1.0, 0.0]]]])
 
     # —— PromptHelperLinearNoiseMask（节点面）——
     inputs = mod.PromptHelperLinearNoiseMask.INPUT_TYPES()["required"]
